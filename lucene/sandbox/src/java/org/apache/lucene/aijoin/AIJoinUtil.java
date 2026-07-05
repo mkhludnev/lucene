@@ -1,0 +1,268 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.lucene.aijoin;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.column.Column;
+import org.apache.lucene.document.column.ColumnBatch;
+import org.apache.lucene.document.column.LongColumn;
+import org.apache.lucene.document.column.LongTupleCursor;
+import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.DocValuesType;
+import org.apache.lucene.index.FilterLeafReader;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.StringHelper;
+
+/**
+ * Utilities for building and addressing the auxiliary AI join index: for every (from-segment,
+ * to-segment) pair it holds a SORTED_NUMERIC column named {@link #pairFieldName}, whose doc number
+ * is the from-side doc id and whose value is the to-side doc id whose {@code toField} term equals
+ * the from doc's {@code fromField} term.
+ */
+final class AIJoinUtil {
+
+  private AIJoinUtil() {}
+
+  /**
+   * Writes the doc-map columns for all (from-segment, to-segment) pairs into {@code writer} as a
+   * single column-oriented batch and commits. Every pair column shares the batch's doc space
+   * {@code [0, maxFromDoc)}, so a from-side doc id is the doc number in any pair column.
+   */
+  static IndexWriter writeAJoinIndex(
+      IndexWriter writer,
+      IndexReader fromReader,
+      String fromField,
+      IndexReader toReader,
+      String toField)
+      throws IOException {
+    // first pass: pair columns are addressed by from-side doc id, so the batch doc space must
+    // cover the largest from-segment maxDoc; the merge scratch needs the largest ordinal space
+    long maxFromValueCount = 0;
+    int maxFromDoc = 0;
+    for (LeafReaderContext fromContext : fromReader.leaves()) {
+      maxFromValueCount =
+          Math.max(
+              maxFromValueCount,
+              DocValues.getSortedSet(fromContext.reader(), fromField).getValueCount());
+      maxFromDoc = Math.max(maxFromDoc, fromContext.reader().maxDoc());
+    }
+    final int batchNumDocs = maxFromDoc;
+    if (batchNumDocs > 0 && maxFromValueCount > 0) {
+      long[] scratch = new long[(int) maxFromValueCount];
+      // lazy generator over the (toContext, fromContext) pairs: each next() runs the dictionary
+      // merge for one pair and yields its column. processBatch iterates columns() more than once
+      // (validation pass, then column-oriented pass), so the Iterable restarts and recomputes.
+      Iterable<Column> columns =
+          () ->
+              new Iterator<>() {
+                private final Iterator<LeafReaderContext> toLeaves = toReader.leaves().iterator();
+                private Iterator<LeafReaderContext> fromLeaves = Collections.emptyIterator();
+                private LeafReaderContext toContext;
+
+                @Override
+                public boolean hasNext() {
+                  while (fromLeaves.hasNext() == false) {
+                    if (toLeaves.hasNext() == false) {
+                      return false;
+                    }
+                    toContext = toLeaves.next();
+                    fromLeaves = fromReader.leaves().iterator();
+                  }
+                  return true;
+                }
+
+                @Override
+                public Column next() {
+                  if (hasNext() == false) {
+                    throw new NoSuchElementException();
+                  }
+                  LeafReaderContext fromContext = fromLeaves.next();
+                  try {
+                    return mapPairOrdinals(fromContext, fromField, toContext, toField, scratch);
+                  } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                  }
+                }
+              };
+      writer.addBatch(
+          new ColumnBatch() {
+            @Override
+            public int numDocs() {
+              return batchNumDocs;
+            }
+
+            @Override
+            public Iterable<Column> columns() {
+              return columns;
+            }
+          });
+    }
+    writer.commit();
+    return writer;
+  }
+
+  /**
+   * Merges the sorted term dictionaries of one (from-segment, to-segment) pair and returns the
+   * pair's doc-map column resolving from-side doc ids to to-side doc ids. {@code scratch} is a
+   * shared from-ord indexed merge buffer, safe to reuse for the next pair since the returned
+   * column owns its per-doc array.
+   */
+  static Column mapPairOrdinals(
+      LeafReaderContext fromContext,
+      String fromField,
+      LeafReaderContext toContext,
+      String toField,
+      long[] scratch)
+      throws IOException {
+    SortedSetDocValues fromDV = DocValues.getSortedSet(fromContext.reader(), fromField);
+    SortedSetDocValues toDV = DocValues.getSortedSet(toContext.reader(), toField);
+    // map from-segment ords to to-segment ords by merging the two sorted term dictionaries
+    long[] toOrdByFromOrd = scratch;
+    Arrays.fill(toOrdByFromOrd, -1L);
+    long[] fromOrdByToOrd = new long[(int) toDV.getValueCount()];
+    Arrays.fill(fromOrdByToOrd, -1L);
+    TermsEnum fromTerms = fromDV.termsEnum();
+    TermsEnum toTerms = toDV.termsEnum();
+    BytesRef fromTerm = fromTerms.next();
+    BytesRef toTerm = toTerms.next();
+    while (fromTerm != null && toTerm != null) {
+      int cmp = fromTerm.compareTo(toTerm);
+      if (cmp == 0) {
+        toOrdByFromOrd[(int) fromTerms.ord()] = toTerms.ord();
+        fromOrdByToOrd[(int) toTerms.ord()] = fromTerms.ord();
+        fromTerm = fromTerms.next();
+        toTerm = toTerms.next();
+      } else if (cmp < 0) {
+        fromTerm = fromTerms.next();
+      } else {
+        toTerm = toTerms.next();
+      }
+    }
+    int[] toDocByToOrd = new int[(int)toDV.getValueCount()];
+    Arrays.fill(toDocByToOrd, -1);
+    for (int toDoc = toDV.nextDoc();
+        toDoc != DocIdSetIterator.NO_MORE_DOCS;
+        toDoc = toDV.nextDoc()) {
+      for (int i = 0; i < toDV.docValueCount(); i++) {
+        long toOrd = toDV.nextOrd();
+        toDocByToOrd[(int)toOrd] = toDoc;
+      }
+    }
+
+    // resolve every from doc to its to-side ordinal: the doc's fromField ord looked up in the
+    // dictionary merge result. Docs without the field, or whose term has no to-side match, keep -1
+    int[] toDocByFromDoc = new int[fromContext.reader().maxDoc()];
+    Arrays.fill(toDocByFromDoc, -1);
+    for (int fromDoc = fromDV.nextDoc();
+        fromDoc != DocIdSetIterator.NO_MORE_DOCS;
+        fromDoc = fromDV.nextDoc()) {
+      for (int i = 0; i < fromDV.docValueCount(); i++) {
+        long fromOrd = fromDV.nextOrd();
+        int toOrd = (int) toOrdByFromOrd[(int) fromOrd];
+        if (toOrd == -1) {
+          continue;
+        }
+        int toDoc = toDocByToOrd[toOrd];
+        if (toDoc == -1) {
+          continue;
+        }
+        toDocByFromDoc[fromDoc] = toDoc;
+      }
+    }
+    return ordMapBatch(
+        pairFieldName(fromContext, fromField, toContext, toField),
+        //fromContext, fromDV, toContext, toDV,
+        toDocByFromDoc
+      );
+  }
+
+  /** The join index field name addressing the ordinal map of one (from-segment, to-segment) pair. */
+  static String pairFieldName(
+      LeafReaderContext fromContext, String fromField, LeafReaderContext toContext, String toField) {
+    return getSideKey(fromContext, fromField) + "_" + getSideKey(toContext, toField);
+  }
+
+  /**
+   * A column persisting a doc mapping: batch-local doc number is the from-side doc id and the
+   * SORTED_NUMERIC docvalue is the matching to-side doc id. From docs without a match keep -1 in
+   * the array and get no value, hence the column is sparse.
+   */
+  static Column ordMapBatch(String fieldName, //LeafReaderContext fromContext, SortedSetDocValues fromDV, LeafReaderContext toContext, SortedSetDocValues toDV,
+     int[] toDocByFromDoc) {
+    FieldType dvOnlyType = new FieldType();
+    dvOnlyType.setDocValuesType(DocValuesType.SORTED_NUMERIC);
+    dvOnlyType.freeze();
+    Column column =
+        new LongColumn(fieldName, dvOnlyType, Column.Density.SPARSE) {
+          @Override
+          public LongTupleCursor tuples() {
+            return new LongTupleCursor() {
+              private int fromDoc = -1;
+
+              @Override
+              public int nextDoc() {
+                while (++fromDoc < toDocByFromDoc.length) {
+                  if (toDocByFromDoc[fromDoc] >=0) {
+                    return fromDoc;
+                  }
+                }
+                return DocIdSetIterator.NO_MORE_DOCS;
+              }
+
+              @Override
+              public long longValue() {
+                return toDocByFromDoc[fromDoc];
+              }
+            };
+          }
+        };
+    return column;
+  }
+
+  /**
+   * Persistent identifier of one join side: the join field name, the immutable id the segment was
+   * created with (it survives reopens, growing deletes mask and reorderings of {@link
+   * IndexReader#leaves()}; a merge produces a new segment with a new id) and the docvalues
+   * generation of the join field.
+   */
+  static String getSideKey(LeafReaderContext context, String field) {
+    SegmentReader segmentReader = (SegmentReader) FilterLeafReader.unwrap(context.reader());
+    byte[] segmentId = segmentReader.getSegmentInfo().info.getId();
+    // dvGen starts at -1 and advances only when this particular field receives an in-place
+    // IndexWriter.updateDocValues update; deletes only bump delGen and leave it untouched. So the
+    // key is insensitive to deletes but changes when the join field's docvalues are updated.
+    long dvGen = context.reader().getFieldInfos().fieldInfo(field).getDocValuesGen();
+    String key = field + ":" + StringHelper.idToString(segmentId) + ":" + dvGen;
+    // Lucene puts no hard constraints on field names, but conservatively keep the key usable as
+    // one by reducing it to identifier characters
+    return key.replaceAll("[^A-Za-z0-9_]", "_");
+  }
+}
