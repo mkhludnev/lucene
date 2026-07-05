@@ -24,6 +24,8 @@ gradle/wrapper/gradle-wrapper.jar
 # Eclipse Gradle oddity
 **/bin/default/
 
+.vscode/
+
 # macOS
 .DS_Store
 

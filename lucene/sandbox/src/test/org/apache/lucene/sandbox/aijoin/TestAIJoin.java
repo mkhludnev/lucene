@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.aijoin;
+package org.apache.lucene.sandbox.aijoin;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -38,6 +38,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.SearcherManager;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.join.JoinUtil;
@@ -191,7 +192,8 @@ public class TestAIJoin extends LuceneTestCase {
       throws IOException {
     IndexWriter writer =
         new IndexWriter(newDirectory(), newIndexWriterConfig(new MockAnalyzer(random())));
-    return AIJoinUtil.writeAJoinIndex(writer, fromReader, fromField, toReader, toField);
+    AIJoinUtil.writeAJoinIndex(writer, fromReader, fromField, toReader, toField);
+    return writer;
   }
 
   private static Set<String> expectedParents(ParentChildIndices indices, Set<String> childIds) {
@@ -229,11 +231,13 @@ public class TestAIJoin extends LuceneTestCase {
 
         IndexWriter aJoinWriter =
             writeAJoinIndex(childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
+        // the query reads the join index through a SearcherManager kept next to its writer
+        SearcherManager joinSearcherManager = new SearcherManager(aJoinWriter, null);
 
         Set<String> selectedChildren = randomChildrenSubset(indices);
         Query aiJoinQuery =
             new AIJoinQuery(
-                aJoinWriter,
+                joinSearcherManager,
                 PARENT_ID_FK,
                 anyOfChildren(selectedChildren),
                 newSearcher(childrenReader),
@@ -248,7 +252,7 @@ public class TestAIJoin extends LuceneTestCase {
         assertEquals(
             expectedParents(indices, selectedChildren),
             searchParentIds(newSearcher(parentsReader), joinQuery));
-        IOUtils.close(aJoinWriter, aJoinWriter.getDirectory());
+        IOUtils.close(joinSearcherManager, aJoinWriter, aJoinWriter.getDirectory());
       }
     }
   }

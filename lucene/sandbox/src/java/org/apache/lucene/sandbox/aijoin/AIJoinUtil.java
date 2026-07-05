@@ -14,14 +14,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.aijoin;
+package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.NoSuchElementException;
+import java.util.List;
+import java.util.regex.Pattern;
 
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.column.Column;
@@ -56,7 +55,7 @@ final class AIJoinUtil {
    * single column-oriented batch and commits. Every pair column shares the batch's doc space
    * {@code [0, maxFromDoc)}, so a from-side doc id is the doc number in any pair column.
    */
-  static IndexWriter writeAJoinIndex(
+  static void writeAJoinIndex(
       IndexWriter writer,
       IndexReader fromReader,
       String fromField,
@@ -76,42 +75,16 @@ final class AIJoinUtil {
     }
     final int batchNumDocs = maxFromDoc;
     if (batchNumDocs > 0 && maxFromValueCount > 0) {
-      long[] scratch = new long[(int) maxFromValueCount];
-      // lazy generator over the (toContext, fromContext) pairs: each next() runs the dictionary
-      // merge for one pair and yields its column. processBatch iterates columns() more than once
-      // (validation pass, then column-oriented pass), so the Iterable restarts and recomputes.
-      Iterable<Column> columns =
-          () ->
-              new Iterator<>() {
-                private final Iterator<LeafReaderContext> toLeaves = toReader.leaves().iterator();
-                private Iterator<LeafReaderContext> fromLeaves = Collections.emptyIterator();
-                private LeafReaderContext toContext;
-
-                @Override
-                public boolean hasNext() {
-                  while (fromLeaves.hasNext() == false) {
-                    if (toLeaves.hasNext() == false) {
-                      return false;
-                    }
-                    toContext = toLeaves.next();
-                    fromLeaves = fromReader.leaves().iterator();
-                  }
-                  return true;
-                }
-
-                @Override
-                public Column next() {
-                  if (hasNext() == false) {
-                    throw new NoSuchElementException();
-                  }
-                  LeafReaderContext fromContext = fromLeaves.next();
-                  try {
-                    return mapPairOrdinals(fromContext, fromField, toContext, toField, scratch);
-                  } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                  }
-                }
-              };
+      long[] scratch = new long[Math.toIntExact(maxFromValueCount)];
+      // materialize all pair columns up front: processBatch iterates columns() more than once
+      // (validation pass, then column-oriented pass), and the dictionary merges are too
+      // expensive to recompute on every iteration
+      List<Column> columns = new ArrayList<>();
+      for (LeafReaderContext toContext : toReader.leaves()) {
+        for (LeafReaderContext fromContext : fromReader.leaves()) {
+          columns.add(mapPairOrdinals(fromContext, fromField, toContext, toField, scratch));
+        }
+      }
       writer.addBatch(
           new ColumnBatch() {
             @Override
@@ -126,7 +99,6 @@ final class AIJoinUtil {
           });
     }
     writer.commit();
-    return writer;
   }
 
   /**
@@ -147,8 +119,9 @@ final class AIJoinUtil {
     // map from-segment ords to to-segment ords by merging the two sorted term dictionaries
     long[] toOrdByFromOrd = scratch;
     Arrays.fill(toOrdByFromOrd, -1L);
-    long[] fromOrdByToOrd = new long[(int) toDV.getValueCount()];
-    Arrays.fill(fromOrdByToOrd, -1L);
+    // dead code, kept until M:N support settles: the reverse ord map was filled but never read
+    // long[] fromOrdByToOrd = new long[Math.toIntExact(toDV.getValueCount())];
+    // Arrays.fill(fromOrdByToOrd, -1L);
     TermsEnum fromTerms = fromDV.termsEnum();
     TermsEnum toTerms = toDV.termsEnum();
     BytesRef fromTerm = fromTerms.next();
@@ -157,7 +130,7 @@ final class AIJoinUtil {
       int cmp = fromTerm.compareTo(toTerm);
       if (cmp == 0) {
         toOrdByFromOrd[(int) fromTerms.ord()] = toTerms.ord();
-        fromOrdByToOrd[(int) toTerms.ord()] = fromTerms.ord();
+        // fromOrdByToOrd[(int) toTerms.ord()] = fromTerms.ord();
         fromTerm = fromTerms.next();
         toTerm = toTerms.next();
       } else if (cmp < 0) {
@@ -166,7 +139,13 @@ final class AIJoinUtil {
         toTerm = toTerms.next();
       }
     }
-    int[] toDocByToOrd = new int[(int)toDV.getValueCount()];
+    // TODO: this degrades M:N joins to M:1. Both toDocByToOrd and toDocByFromDoc keep a single
+    // to-side doc per slot, so when several to docs share a term (non-unique toField) or a from
+    // doc is multi-valued with several matching terms, later assignments overwrite earlier ones
+    // and only the last match survives. The read side (AIJoinQuery) already consumes all
+    // docValueCount() values per doc, so only this writer needs to learn to emit multiple
+    // to docs per from doc.
+    int[] toDocByToOrd = new int[Math.toIntExact(toDV.getValueCount())];
     Arrays.fill(toDocByToOrd, -1);
     for (int toDoc = toDV.nextDoc();
         toDoc != DocIdSetIterator.NO_MORE_DOCS;
@@ -247,6 +226,10 @@ final class AIJoinUtil {
     return column;
   }
 
+  // Lucene puts no hard constraints on field names, but conservatively keep side keys usable as
+  // one by reducing them to identifier characters
+  private static final Pattern NON_IDENTIFIER = Pattern.compile("[^A-Za-z0-9_]");
+
   /**
    * Persistent identifier of one join side: the join field name, the immutable id the segment was
    * created with (it survives reopens, growing deletes mask and reorderings of {@link
@@ -261,8 +244,6 @@ final class AIJoinUtil {
     // key is insensitive to deletes but changes when the join field's docvalues are updated.
     long dvGen = context.reader().getFieldInfos().fieldInfo(field).getDocValuesGen();
     String key = field + ":" + StringHelper.idToString(segmentId) + ":" + dvGen;
-    // Lucene puts no hard constraints on field names, but conservatively keep the key usable as
-    // one by reducing it to identifier characters
-    return key.replaceAll("[^A-Za-z0-9_]", "_");
+    return NON_IDENTIFIER.matcher(key).replaceAll("_");
   }
 }
