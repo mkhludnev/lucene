@@ -24,13 +24,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.function.UnaryOperator;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
@@ -38,7 +38,6 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.SearcherManager;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.join.JoinUtil;
@@ -67,6 +66,21 @@ public class TestAIJoin extends LuceneTestCase {
 
   private static final String[] COLORS = {"red", "green", "blue"};
   private static final int CHILDREN_PER_PARENT = 5;
+
+  /** Shared per-test auxiliary join index: pair columns are built lazily by the first search. */
+  private AIJoinIndex joinIndex;
+
+  @Override
+  public void setUp() throws Exception {
+    super.setUp();
+    joinIndex = AIJoinIndex.inMemory();
+  }
+
+  @Override
+  public void tearDown() throws Exception {
+    joinIndex.close();
+    super.tearDown();
+  }
 
   /** Two indices: parents and their children, segmented by intermediate commits. */
   private class ParentChildIndices implements Closeable {
@@ -162,6 +176,35 @@ public class TestAIJoin extends LuceneTestCase {
     return parentIds;
   }
 
+  /**
+   * Searches the same join through {@link JoinUtil} and through the auxiliary join index and
+   * asserts both agree; {@code joinDecorator} wraps each join query the same way before searching.
+   */
+  private Set<String> searchParentIdsBothJoins(
+      IndexSearcher parentsSearcher,
+      Query fromQuery,
+      IndexSearcher childrenSearcher,
+      UnaryOperator<Query> joinDecorator)
+      throws IOException {
+    Query joinUtilQuery = joinChildrenToParents(fromQuery, childrenSearcher);
+    Set<String> joinUtilParents =
+        searchParentIds(parentsSearcher, joinDecorator.apply(joinUtilQuery));
+    Query aiJoinQuery =
+        joinIndex.newJoinQuery(PARENT_ID_FK, fromQuery, childrenSearcher, PARENT_ID);
+    assertEquals(
+        "AIJoinQuery disagrees with JoinUtil",
+        joinUtilParents,
+        searchParentIds(parentsSearcher, joinDecorator.apply(aiJoinQuery)));
+    return joinUtilParents;
+  }
+
+  private Set<String> searchParentIdsBothJoins(
+      IndexSearcher parentsSearcher, Query fromQuery, IndexSearcher childrenSearcher)
+      throws IOException {
+    return searchParentIdsBothJoins(
+        parentsSearcher, fromQuery, childrenSearcher, UnaryOperator.identity());
+  }
+
   private static Query anyOfChildren(Set<String> childIds) {
     BooleanQuery.Builder builder = new BooleanQuery.Builder();
     for (String childId : childIds) {
@@ -199,11 +242,12 @@ public class TestAIJoin extends LuceneTestCase {
         assertTrue("parents index should be segmented", parentsReader.leaves().size() > 1);
 
         Set<String> selectedChildren = randomChildrenSubset(indices);
-        Query joinQuery =
-            joinChildrenToParents(anyOfChildren(selectedChildren), newSearcher(childrenReader));
         assertEquals(
             expectedParents(indices, selectedChildren),
-            searchParentIds(newSearcher(parentsReader), joinQuery));
+            searchParentIdsBothJoins(
+                newSearcher(parentsReader),
+                anyOfChildren(selectedChildren),
+                newSearcher(childrenReader)));
       }
     }
   }
@@ -216,30 +260,35 @@ public class TestAIJoin extends LuceneTestCase {
         assertTrue("children index should be segmented", childrenReader.leaves().size() > 1);
         assertTrue("parents index should be segmented", parentsReader.leaves().size() > 1);
 
-        IndexWriter aJoinWriter =
-            AIJoinUtil.writeAJoinIndex(newDirectory(), childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
-        // the query reads the join index through a SearcherManager kept next to its writer
-        SearcherManager joinSearcherManager = new SearcherManager(aJoinWriter, null);
-
         Set<String> selectedChildren = randomChildrenSubset(indices);
-        Query aiJoinQuery =
-            new AIJoinQuery(
-                joinSearcherManager,
-                PARENT_ID_FK,
+        // the first search builds the missing pair columns into the join index on demand
+        assertEquals(
+            expectedParents(indices, selectedChildren),
+            searchParentIdsBothJoins(
+                newSearcher(parentsReader),
                 anyOfChildren(selectedChildren),
-                newSearcher(childrenReader),
-                parentsReader,
-                PARENT_ID);
-        assertEquals(
-            expectedParents(indices, selectedChildren),
-            searchParentIds(newSearcher(parentsReader), aiJoinQuery));
+                newSearcher(childrenReader)));
+      }
 
-        Query joinQuery =
-            joinChildrenToParents(anyOfChildren(selectedChildren), newSearcher(childrenReader));
+      // grow both sides and reopen: the next search finds the old pair columns persisted and
+      // lazily builds only the pairs involving the new segments
+      String newParentId = "parentNew";
+      String newParentColor = RandomPicks.randomFrom(random(), COLORS);
+      indices.colorByParentId.put(newParentId, newParentColor);
+      indices.parentsWriter.addDocument(parentDoc(newParentId, newParentColor));
+      String newChildId = "childNew";
+      indices.parentIdByChildId.put(newChildId, newParentId);
+      indices.childrenWriter.addDocument(childDoc(newChildId, newParentId));
+      indices.parentsWriter.commit();
+      indices.childrenWriter.commit();
+      try (IndexReader childrenReader = indices.childrenWriter.getReader();
+          IndexReader parentsReader = indices.parentsWriter.getReader()) {
         assertEquals(
-            expectedParents(indices, selectedChildren),
-            searchParentIds(newSearcher(parentsReader), joinQuery));
-        IOUtils.close(joinSearcherManager, aJoinWriter, aJoinWriter.getDirectory());
+            Set.of(newParentId),
+            searchParentIdsBothJoins(
+                newSearcher(parentsReader),
+                new TermQuery(new Term(ID, newChildId)),
+                newSearcher(childrenReader)));
       }
     }
   }
@@ -263,15 +312,18 @@ public class TestAIJoin extends LuceneTestCase {
         IndexSearcher childrenSearcher = newSearcher(childrenReader);
         IndexSearcher parentsSearcher = newSearcher(parentsReader);
 
-        Query joinFromChild =
-            joinChildrenToParents(new TermQuery(new Term(ID, childId)), childrenSearcher);
-        assertEquals(Set.of(newParentId), searchParentIds(parentsSearcher, joinFromChild));
+        assertEquals(
+            Set.of(newParentId),
+            searchParentIdsBothJoins(
+                parentsSearcher, new TermQuery(new Term(ID, childId)), childrenSearcher));
 
         // the old parent is still reachable through its remaining children
-        Query joinFromOldSiblings =
-            joinChildrenToParents(
-                new TermQuery(new Term(PARENT_ID_FK, oldParentId)), childrenSearcher);
-        assertEquals(Set.of(oldParentId), searchParentIds(parentsSearcher, joinFromOldSiblings));
+        assertEquals(
+            Set.of(oldParentId),
+            searchParentIdsBothJoins(
+                parentsSearcher,
+                new TermQuery(new Term(PARENT_ID_FK, oldParentId)),
+                childrenSearcher));
       }
     }
   }
@@ -287,10 +339,12 @@ public class TestAIJoin extends LuceneTestCase {
       try (IndexReader childrenReader = indices.childrenWriter.getReader();
           IndexReader parentsReader = indices.parentsWriter.getReader()) {
         // children still point at the old id, so they join to nothing
-        Query danglingJoin =
-            joinChildrenToParents(
-                new TermQuery(new Term(PARENT_ID_FK, parentId)), newSearcher(childrenReader));
-        assertEquals(Set.of(), searchParentIds(newSearcher(parentsReader), danglingJoin));
+        assertEquals(
+            Set.of(),
+            searchParentIdsBothJoins(
+                newSearcher(parentsReader),
+                new TermQuery(new Term(PARENT_ID_FK, parentId)),
+                newSearcher(childrenReader)));
       }
 
       // re-point one child at the renamed parent and the join works again
@@ -300,36 +354,30 @@ public class TestAIJoin extends LuceneTestCase {
 
       try (IndexReader childrenReader = indices.childrenWriter.getReader();
           IndexReader parentsReader = indices.parentsWriter.getReader()) {
-        Query joinFromChild =
-            joinChildrenToParents(
-                new TermQuery(new Term(ID, childId)), newSearcher(childrenReader));
         assertEquals(
-            Set.of(renamedParentId), searchParentIds(newSearcher(parentsReader), joinFromChild));
+            Set.of(renamedParentId),
+            searchParentIdsBothJoins(
+                newSearcher(parentsReader),
+                new TermQuery(new Term(ID, childId)),
+                newSearcher(childrenReader)));
       }
     }
   }
 
   public void testAIJoinWithParentTermFilter() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
+      // open() takes ownership of the sidecar directory, so joinIndex.close() closes it too
       try (IndexReader childrenReader = indices.childrenWriter.getReader();
-          IndexReader parentsReader = indices.parentsWriter.getReader()) {
+          IndexReader parentsReader = indices.parentsWriter.getReader();
+          AIJoinIndex joinIndex = AIJoinIndex.open(newDirectory())) {
         Set<String> selectedChildren = randomChildrenSubset(indices);
         String color = RandomPicks.randomFrom(random(), COLORS);
 
-        // Query joinQuery =
-        //     joinChildrenToParents(anyOfChildren(selectedChildren), newSearcher(childrenReader));
-        IndexWriter aJoinWriter =
-            AIJoinUtil.writeAJoinIndex(newDirectory(), childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
-
-        SearcherManager joinSearcherManager = new SearcherManager(aJoinWriter, null);
-
         Query aiJoinQuery =
-            new AIJoinQuery(
-                joinSearcherManager,
+            joinIndex.newJoinQuery(
                 PARENT_ID_FK,
                 anyOfChildren(selectedChildren),
                 newSearcher(childrenReader),
-                parentsReader,
                 PARENT_ID);
 
         Query filteredJoin =
@@ -345,7 +393,6 @@ public class TestAIJoin extends LuceneTestCase {
           }
         }
         assertEquals(expected, searchParentIds(newSearcher(parentsReader), filteredJoin));
-        IOUtils.close(joinSearcherManager, aJoinWriter, aJoinWriter.getDirectory());
       }
     }
   }
@@ -357,21 +404,23 @@ public class TestAIJoin extends LuceneTestCase {
         Set<String> selectedChildren = randomChildrenSubset(indices);
         String color = RandomPicks.randomFrom(random(), COLORS);
 
-        Query joinQuery =
-            joinChildrenToParents(anyOfChildren(selectedChildren), newSearcher(childrenReader));
-        Query filteredJoin =
-            new BooleanQuery.Builder()
-                .add(joinQuery, BooleanClause.Occur.MUST)
-                .add(new TermQuery(new Term(COLOR, color)), BooleanClause.Occur.FILTER)
-                .build();
-
         Set<String> expected = new TreeSet<>();
         for (String parentId : expectedParents(indices, selectedChildren)) {
           if (color.equals(indices.colorByParentId.get(parentId))) {
             expected.add(parentId);
           }
         }
-        assertEquals(expected, searchParentIds(newSearcher(parentsReader), filteredJoin));
+        assertEquals(
+            expected,
+            searchParentIdsBothJoins(
+                newSearcher(parentsReader),
+                anyOfChildren(selectedChildren),
+                newSearcher(childrenReader),
+                join ->
+                    new BooleanQuery.Builder()
+                        .add(join, BooleanClause.Occur.MUST)
+                        .add(new TermQuery(new Term(COLOR, color)), BooleanClause.Occur.FILTER)
+                        .build()));
       }
     }
   }

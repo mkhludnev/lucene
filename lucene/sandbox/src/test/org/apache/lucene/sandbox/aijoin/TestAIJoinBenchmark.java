@@ -32,7 +32,6 @@ import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
-import org.apache.lucene.search.SearcherManager;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.join.JoinUtil;
@@ -50,8 +49,8 @@ import org.apache.lucene.util.IOUtils;
  * child-side term filter selects ~10K children that join to ~1K parents; a second case adds a
  * parent-side filter on top of the join. Results are not asserted, only timed: each search repeats
  * {@link #PASSES} times and min/max/avg wall times are printed. The indices are never updated
- * after the build, and the AI join {@link SearcherManager} is created once and reused between
- * passes.
+ * after the build, and the {@link AIJoinIndex} is opened once and reused between passes: its pair
+ * columns are built lazily by the first search, which is timed separately.
  */
 public class TestAIJoinBenchmark extends LuceneTestCase {
 
@@ -102,15 +101,16 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
         Query childFilter = new TermQuery(new Term(TAG, HOT));
         Query parentFilter = new TermQuery(new Term(COLOR, color(0)));
 
-        // the auxiliary join index and its SearcherManager are built once and reused by all passes
-        Directory joinDir = newDirectory();
+        // the auxiliary join index is opened once and reused by all passes; the first search
+        // builds all pair columns lazily, so it's timed apart from the steady-state passes
+        AIJoinIndex joinIndex = AIJoinIndex.open(newDirectory());
         long buildStart = System.nanoTime();
-        IndexWriter joinWriter = AIJoinUtil.writeAJoinIndex(joinDir, childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
+        parentsSearcher.search(
+            aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher), 10);
         System.out.printf(
             Locale.ROOT,
-            "AI join index build: %.2fms%n",
+            "AI join first search (lazy pair build): %.2fms%n",
             (System.nanoTime() - buildStart) / 1_000_000d);
-        SearcherManager joinSearcherManager = new SearcherManager(joinWriter, null);
 
         // join query creation is inside the timed task on purpose: JoinUtil runs the from-side
         // selection eagerly in createJoinQuery, AIJoinQuery lazily in createWeight, so only
@@ -124,9 +124,7 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
             "AIJoin",
             () ->
                 parentsSearcher.search(
-                    aiJoinChildrenToParents(
-                        joinSearcherManager, childFilter, childrenSearcher, parentsReader),
-                    10));
+                    aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher), 10));
         bench(
             "JoinUtil + parent filter",
             () ->
@@ -139,12 +137,12 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
             () ->
                 parentsSearcher.search(
                     filterParents(
-                        aiJoinChildrenToParents(
-                            joinSearcherManager, childFilter, childrenSearcher, parentsReader),
+                        aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher),
                         parentFilter),
                     10));
 
-        IOUtils.close(joinSearcherManager, joinWriter, joinDir);
+        // open() took ownership of the sidecar directory, so this closes it too
+        IOUtils.close(joinIndex);
       }
     }
   }
@@ -157,12 +155,8 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
   }
 
   private static Query aiJoinChildrenToParents(
-      SearcherManager joinSearcherManager,
-      Query childFilter,
-      IndexSearcher childrenSearcher,
-      IndexReader parentsReader) {
-    return new AIJoinQuery(
-        joinSearcherManager, PARENT_ID_FK, childFilter, childrenSearcher, parentsReader, PARENT_ID);
+      AIJoinIndex joinIndex, Query childFilter, IndexSearcher childrenSearcher) {
+    return joinIndex.newJoinQuery(PARENT_ID_FK, childFilter, childrenSearcher, PARENT_ID);
   }
 
   private static String color(int index) {

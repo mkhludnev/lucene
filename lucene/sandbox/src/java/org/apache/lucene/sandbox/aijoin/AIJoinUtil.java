@@ -17,42 +17,43 @@
 package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
 
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.column.Column;
-import org.apache.lucene.document.column.ColumnBatch;
 import org.apache.lucene.document.column.LongColumn;
 import org.apache.lucene.document.column.LongColumn.NumericKind;
 import org.apache.lucene.document.column.LongTupleCursor;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesType;
+import org.apache.lucene.index.FilterCodecReader;
 import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.index.NoMergePolicy;
-import org.apache.lucene.index.NoMergeScheduler;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.StringHelper;
 
 /**
- * Utilities for building and addressing the auxiliary AI join index: for every (from-segment,
- * to-segment) pair it holds a SORTED_NUMERIC column named {@link #pairFieldName}, whose doc number
- * is the from-side doc id and whose value is the to-side doc id whose {@code toField} term equals
- * the from doc's {@code fromField} term.
+ * Column-building and addressing helpers for the auxiliary join index managed by {@link
+ * AIJoinIndex}: for every (from-segment, to-segment) pair it produces a SORTED_NUMERIC column
+ * named {@link #pairFieldName}, whose doc number is the from-side doc id and whose value is the
+ * to-side doc id whose {@code toField} term equals the from doc's {@code fromField} term, plus two
+ * companion edges columns persisting the pair's {min, max} from-doc and to-doc bounds.
  */
 final class AIJoinUtil {
 
+  /** Suffix of the always-written column persisting a pair's {min, max} from-doc edges. */
+  static final String FROM_EDGES_SUFFIX = "_fromDoc_edges";
+
+  /** Suffix of the always-written column persisting a pair's {min, max} to-doc edges. */
+  static final String TO_EDGES_SUFFIX = "_toDoc_edges";
 
   private static final FieldType toDocsFieldType = new FieldType();
 
@@ -65,60 +66,10 @@ final class AIJoinUtil {
   private AIJoinUtil() {}
 
   /**
-   * Writes the doc-map columns for all (from-segment, to-segment) pairs into {@code writer} as a
-   * single column-oriented batch and commits. Every pair column shares the batch's doc space
-   * {@code [0, maxFromDoc)}, so a from-side doc id is the doc number in any pair column.
-   */
-  static void writeAJoinIndex(
-      IndexWriter writer,
-      IndexReader fromReader,
-      String fromField,
-      IndexReader toReader,
-      String toField)
-      throws IOException {
-    // first pass: pair columns are addressed by from-side doc id, so the batch doc space must
-    // cover the largest from-segment maxDoc; the merge scratch needs the largest ordinal space
-    long maxFromValueCount = 0;
-    int maxFromDoc = 0;
-    for (LeafReaderContext fromContext : fromReader.leaves()) {
-      maxFromValueCount =
-          Math.max(
-              maxFromValueCount,
-              DocValues.getSortedSet(fromContext.reader(), fromField).getValueCount());
-      maxFromDoc = Math.max(maxFromDoc, fromContext.reader().maxDoc());
-    }
-    final int batchNumDocs = maxFromDoc;
-    if (batchNumDocs > 0 && maxFromValueCount > 0) {
-      long[] scratch = new long[Math.toIntExact(maxFromValueCount)];
-      // materialize all pair columns up front: processBatch iterates columns() more than once
-      // (validation pass, then column-oriented pass), and the dictionary merges are too
-      // expensive to recompute on every iteration
-      List<Column> columns = new ArrayList<>();
-      for (LeafReaderContext toContext : toReader.leaves()) {
-        for (LeafReaderContext fromContext : fromReader.leaves()) {
-          columns.addAll(mapPairOrdinals(fromContext, fromField, toContext, toField, scratch));
-        }
-      }
-      writer.addBatch(
-          new ColumnBatch() {
-            @Override
-            public int numDocs() {
-              return batchNumDocs;
-            }
-
-            @Override
-            public Iterable<Column> columns() {
-              return columns;
-            }
-          });
-    }
-    writer.commit();
-  }
-
-  /**
    * Merges the sorted term dictionaries of one (from-segment, to-segment) pair and returns the
-   * pair's columns: the doc-map column resolving from-side doc ids to to-side doc ids, and an
-   * empty companion column named with the {@code _edges} suffix. {@code scratch} is a shared
+   * pair's columns: the doc-map column resolving from-side doc ids to to-side doc ids, and the
+   * edges companion columns. The edges columns are written even when the pair maps nothing, so a
+   * once-built pair is detectable in the join index and never rebuilt. {@code scratch} is a shared
    * from-ord indexed merge buffer, safe to reuse for the next pair since the returned columns own
    * their per-doc arrays.
    */
@@ -205,8 +156,8 @@ final class AIJoinUtil {
             pairFieldName,
             //fromContext, fromDV, toContext, toDV,
             toDocByFromDoc),
-        edgesColumn(pairFieldName + "_fromDoc_edges", new int[]{minFromDoc,maxFromDoc}),
-        edgesColumn(pairFieldName + "_toDoc_edges", new int[]{minToDoc,maxToDoc})
+        edgesColumn(pairFieldName + FROM_EDGES_SUFFIX, new int[]{minFromDoc,maxFromDoc}),
+        edgesColumn(pairFieldName + TO_EDGES_SUFFIX, new int[]{minToDoc,maxToDoc})
       );
   }
 
@@ -285,8 +236,7 @@ final class AIJoinUtil {
    * generation of the join field.
    */
   static String getSideKey(LeafReaderContext context, String field) {
-    SegmentReader segmentReader = (SegmentReader) FilterLeafReader.unwrap(context.reader());
-    byte[] segmentId = segmentReader.getSegmentInfo().info.getId();
+    byte[] segmentId = segmentReader(context.reader()).getSegmentInfo().info.getId();
     // dvGen starts at -1 and advances only when this particular field receives an in-place
     // IndexWriter.updateDocValues update; deletes only bump delGen and leave it untouched. So the
     // key is insensitive to deletes but changes when the join field's docvalues are updated.
@@ -296,19 +246,23 @@ final class AIJoinUtil {
   }
 
   /**
-   * Allocates a directory and writes the auxiliary join index for joining {@code fromField} values
-   * to {@code toField} values; see {@link writeAJoinIndex}.
+   * Peels wrappers off a leaf reader down to its {@link SegmentReader}. {@link
+   * FilterLeafReader#unwrap} alone is not enough: wrappers like {@code
+   * SoftDeletesDirectoryReaderWrapper} produce {@link FilterCodecReader} leaves, which are not
+   * {@link FilterLeafReader}s, and the two kinds may alternate.
    */
-  public static IndexWriter writeAJoinIndex( Directory aiJoinDir,
-      IndexReader fromReader, String fromField, IndexReader toReader, String toField)
-      throws IOException {
-    IndexWriter writer =
-        new IndexWriter(
-            aiJoinDir,
-            new IndexWriterConfig()
-                .setMergePolicy(NoMergePolicy.INSTANCE)
-                .setMergeScheduler(NoMergeScheduler.INSTANCE));
-    writeAJoinIndex(writer, fromReader, fromField, toReader, toField);
-    return writer;
+  static SegmentReader segmentReader(LeafReader reader) {
+    while (true) {
+      if (reader instanceof SegmentReader segmentReader) {
+        return segmentReader;
+      } else if (reader instanceof FilterLeafReader filterLeafReader) {
+        reader = filterLeafReader.getDelegate();
+      } else if (reader instanceof FilterCodecReader filterCodecReader) {
+        reader = filterCodecReader.getDelegate();
+      } else {
+        throw new IllegalArgumentException(
+            "cannot unwrap a SegmentReader from " + reader.getClass().getName());
+      }
+    }
   }
 }
