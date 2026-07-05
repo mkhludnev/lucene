@@ -183,19 +183,6 @@ public class TestAIJoin extends LuceneTestCase {
     return selected;
   }
 
-  /**
-   * Allocates a directory and writes the auxiliary join index for joining {@code fromField} values
-   * to {@code toField} values; see {@link AIJoinUtil#writeAJoinIndex}.
-   */
-  private static IndexWriter writeAJoinIndex(
-      IndexReader fromReader, String fromField, IndexReader toReader, String toField)
-      throws IOException {
-    IndexWriter writer =
-        new IndexWriter(newDirectory(), newIndexWriterConfig(new MockAnalyzer(random())));
-    AIJoinUtil.writeAJoinIndex(writer, fromReader, fromField, toReader, toField);
-    return writer;
-  }
-
   private static Set<String> expectedParents(ParentChildIndices indices, Set<String> childIds) {
     Set<String> expected = new TreeSet<>();
     for (String childId : childIds) {
@@ -230,7 +217,7 @@ public class TestAIJoin extends LuceneTestCase {
         assertTrue("parents index should be segmented", parentsReader.leaves().size() > 1);
 
         IndexWriter aJoinWriter =
-            writeAJoinIndex(childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
+            AIJoinUtil.writeAJoinIndex(newDirectory(), childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
         // the query reads the join index through a SearcherManager kept next to its writer
         SearcherManager joinSearcherManager = new SearcherManager(aJoinWriter, null);
 
@@ -322,7 +309,48 @@ public class TestAIJoin extends LuceneTestCase {
     }
   }
 
-  public void testJoinWithParentTermFilter() throws Exception {
+  public void testAIJoinWithParentTermFilter() throws Exception {
+    try (ParentChildIndices indices = new ParentChildIndices()) {
+      try (IndexReader childrenReader = indices.childrenWriter.getReader();
+          IndexReader parentsReader = indices.parentsWriter.getReader()) {
+        Set<String> selectedChildren = randomChildrenSubset(indices);
+        String color = RandomPicks.randomFrom(random(), COLORS);
+
+        // Query joinQuery =
+        //     joinChildrenToParents(anyOfChildren(selectedChildren), newSearcher(childrenReader));
+        IndexWriter aJoinWriter =
+            AIJoinUtil.writeAJoinIndex(newDirectory(), childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
+
+        SearcherManager joinSearcherManager = new SearcherManager(aJoinWriter, null);
+
+        Query aiJoinQuery =
+            new AIJoinQuery(
+                joinSearcherManager,
+                PARENT_ID_FK,
+                anyOfChildren(selectedChildren),
+                newSearcher(childrenReader),
+                parentsReader,
+                PARENT_ID);
+
+        Query filteredJoin =
+            new BooleanQuery.Builder()
+                .add(aiJoinQuery, BooleanClause.Occur.MUST)
+                .add(new TermQuery(new Term(COLOR, color)), BooleanClause.Occur.FILTER)
+                .build();
+
+        Set<String> expected = new TreeSet<>();
+        for (String parentId : expectedParents(indices, selectedChildren)) {
+          if (color.equals(indices.colorByParentId.get(parentId))) {
+            expected.add(parentId);
+          }
+        }
+        assertEquals(expected, searchParentIds(newSearcher(parentsReader), filteredJoin));
+        IOUtils.close(joinSearcherManager, aJoinWriter, aJoinWriter.getDirectory());
+      }
+    }
+  }
+
+    public void testJoinWithParentTermFilter() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
       try (IndexReader childrenReader = indices.childrenWriter.getReader();
           IndexReader parentsReader = indices.parentsWriter.getReader()) {

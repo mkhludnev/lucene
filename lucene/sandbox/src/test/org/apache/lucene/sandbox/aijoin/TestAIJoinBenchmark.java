@@ -62,7 +62,8 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
 
   private static final String HOT = "hot";
   private static final String COLD = "cold";
-  private static final String[] COLORS = {"red", "green", "blue"};
+  // the parent filter matches one of COLOR_CARDINALITY colors, passing ~1/30 of the joined parents
+  private static final int COLOR_CARDINALITY = 30;
 
   private static final int NUM_PARENTS = 10_000;
   private static final int CHILDREN_PER_PARENT = 10;
@@ -99,15 +100,12 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
         parentsSearcher.setQueryCache(null);
 
         Query childFilter = new TermQuery(new Term(TAG, HOT));
-        Query parentFilter = new TermQuery(new Term(COLOR, COLORS[0]));
+        Query parentFilter = new TermQuery(new Term(COLOR, color(0)));
 
         // the auxiliary join index and its SearcherManager are built once and reused by all passes
         Directory joinDir = newDirectory();
-        IndexWriter joinWriter =
-            new IndexWriter(joinDir, newIndexWriterConfig(new MockAnalyzer(random())));
         long buildStart = System.nanoTime();
-        AIJoinUtil.writeAJoinIndex(
-            joinWriter, childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
+        IndexWriter joinWriter = AIJoinUtil.writeAJoinIndex(joinDir, childrenReader, PARENT_ID_FK, parentsReader, PARENT_ID);
         System.out.printf(
             Locale.ROOT,
             "AI join index build: %.2fms%n",
@@ -165,6 +163,10 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
       IndexReader parentsReader) {
     return new AIJoinQuery(
         joinSearcherManager, PARENT_ID_FK, childFilter, childrenSearcher, parentsReader, PARENT_ID);
+  }
+
+  private static String color(int index) {
+    return "color" + index;
   }
 
   private static Query filterParents(Query joinQuery, Query parentFilter) {
@@ -233,7 +235,10 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
         Document parentDoc = new Document();
         parentDoc.add(new StringField(PARENT_ID, parentId, Field.Store.NO));
         parentDoc.add(new SortedDocValuesField(PARENT_ID, new BytesRef(parentId)));
-        parentDoc.add(new StringField(COLOR, COLORS[p % COLORS.length], Field.Store.NO));
+        // cycle colors by hot rank, not by p: a plain p % COLOR_CARDINALITY would correlate with
+        // the p % HOT_STRIDE hot selection and the filter wouldn't thin the joined parents
+        parentDoc.add(
+            new StringField(COLOR, color((p / HOT_STRIDE) % COLOR_CARDINALITY), Field.Store.NO));
         parentsWriter.addDocument(parentDoc);
         if ((p + 1) % parentsPerSegment == 0) {
           parentsWriter.commit();

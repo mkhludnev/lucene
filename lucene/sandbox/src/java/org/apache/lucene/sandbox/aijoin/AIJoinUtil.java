@@ -26,17 +26,22 @@ import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.column.Column;
 import org.apache.lucene.document.column.ColumnBatch;
 import org.apache.lucene.document.column.LongColumn;
+import org.apache.lucene.document.column.LongColumn.NumericKind;
 import org.apache.lucene.document.column.LongTupleCursor;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.index.NoMergeScheduler;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.StringHelper;
 
@@ -47,6 +52,15 @@ import org.apache.lucene.util.StringHelper;
  * the from doc's {@code fromField} term.
  */
 final class AIJoinUtil {
+
+
+  private static final FieldType toDocsFieldType = new FieldType();
+
+  static {
+    toDocsFieldType.setDocValuesType(DocValuesType.SORTED_NUMERIC);
+    toDocsFieldType.freeze();
+  }
+
 
   private AIJoinUtil() {}
 
@@ -82,7 +96,7 @@ final class AIJoinUtil {
       List<Column> columns = new ArrayList<>();
       for (LeafReaderContext toContext : toReader.leaves()) {
         for (LeafReaderContext fromContext : fromReader.leaves()) {
-          columns.add(mapPairOrdinals(fromContext, fromField, toContext, toField, scratch));
+          columns.addAll(mapPairOrdinals(fromContext, fromField, toContext, toField, scratch));
         }
       }
       writer.addBatch(
@@ -103,11 +117,12 @@ final class AIJoinUtil {
 
   /**
    * Merges the sorted term dictionaries of one (from-segment, to-segment) pair and returns the
-   * pair's doc-map column resolving from-side doc ids to to-side doc ids. {@code scratch} is a
-   * shared from-ord indexed merge buffer, safe to reuse for the next pair since the returned
-   * column owns its per-doc array.
+   * pair's columns: the doc-map column resolving from-side doc ids to to-side doc ids, and an
+   * empty companion column named with the {@code _edges} suffix. {@code scratch} is a shared
+   * from-ord indexed merge buffer, safe to reuse for the next pair since the returned columns own
+   * their per-doc arrays.
    */
-  static Column mapPairOrdinals(
+  static List<Column> mapPairOrdinals(
       LeafReaderContext fromContext,
       String fromField,
       LeafReaderContext toContext,
@@ -160,6 +175,10 @@ final class AIJoinUtil {
     // dictionary merge result. Docs without the field, or whose term has no to-side match, keep -1
     int[] toDocByFromDoc = new int[fromContext.reader().maxDoc()];
     Arrays.fill(toDocByFromDoc, -1);
+    int minFromDoc = DocIdSetIterator.NO_MORE_DOCS;
+    int maxFromDoc = -1;
+    int minToDoc = DocIdSetIterator.NO_MORE_DOCS;
+    int maxToDoc = -1;
     for (int fromDoc = fromDV.nextDoc();
         fromDoc != DocIdSetIterator.NO_MORE_DOCS;
         fromDoc = fromDV.nextDoc()) {
@@ -174,13 +193,44 @@ final class AIJoinUtil {
           continue;
         }
         toDocByFromDoc[fromDoc] = toDoc;
+        minFromDoc = Math.min(minFromDoc, fromDoc);
+        maxFromDoc = Math.max(maxFromDoc, fromDoc);
+        minToDoc = Math.min(minToDoc, toDoc);
+        maxToDoc = Math.max(maxToDoc, toDoc);
       }
     }
-    return ordMapBatch(
-        pairFieldName(fromContext, fromField, toContext, toField),
-        //fromContext, fromDV, toContext, toDV,
-        toDocByFromDoc
+    String pairFieldName = pairFieldName(fromContext, fromField, toContext, toField);
+    return List.of(
+        ordMapBatch(
+            pairFieldName,
+            //fromContext, fromDV, toContext, toDV,
+            toDocByFromDoc),
+        edgesColumn(pairFieldName + "_fromDoc_edges", new int[]{minFromDoc,maxFromDoc}),
+        edgesColumn(pairFieldName + "_toDoc_edges", new int[]{minToDoc,maxToDoc})
       );
+  }
+
+  private static LongColumn edgesColumn(String fromEdgesFieldName, int[] fromDocEdges) {
+    return new LongColumn(fromEdgesFieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
+      @Override
+      public LongTupleCursor tuples() {
+        return new LongTupleCursor() {
+          int i=-1;
+          @Override
+          public int nextDoc() {
+            if (++i<fromDocEdges.length) {
+              return 0; //try to put both vals at the doc 0
+            }
+            return DocIdSetIterator.NO_MORE_DOCS;
+          }
+
+          @Override
+          public long longValue() {
+            return (long) fromDocEdges[i];
+          }
+        };
+      }
+    };
   }
 
   /** The join index field name addressing the ordinal map of one (from-segment, to-segment) pair. */
@@ -194,13 +244,11 @@ final class AIJoinUtil {
    * SORTED_NUMERIC docvalue is the matching to-side doc id. From docs without a match keep -1 in
    * the array and get no value, hence the column is sparse.
    */
-  static Column ordMapBatch(String fieldName, //LeafReaderContext fromContext, SortedSetDocValues fromDV, LeafReaderContext toContext, SortedSetDocValues toDV,
+  static Column ordMapBatch(String fieldName,
      int[] toDocByFromDoc) {
-    FieldType dvOnlyType = new FieldType();
-    dvOnlyType.setDocValuesType(DocValuesType.SORTED_NUMERIC);
-    dvOnlyType.freeze();
+
     Column column =
-        new LongColumn(fieldName, dvOnlyType, Column.Density.SPARSE) {
+        new LongColumn(fieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
           @Override
           public LongTupleCursor tuples() {
             return new LongTupleCursor() {
@@ -245,5 +293,22 @@ final class AIJoinUtil {
     long dvGen = context.reader().getFieldInfos().fieldInfo(field).getDocValuesGen();
     String key = field + ":" + StringHelper.idToString(segmentId) + ":" + dvGen;
     return NON_IDENTIFIER.matcher(key).replaceAll("_");
+  }
+
+  /**
+   * Allocates a directory and writes the auxiliary join index for joining {@code fromField} values
+   * to {@code toField} values; see {@link writeAJoinIndex}.
+   */
+  public static IndexWriter writeAJoinIndex( Directory aiJoinDir,
+      IndexReader fromReader, String fromField, IndexReader toReader, String toField)
+      throws IOException {
+    IndexWriter writer =
+        new IndexWriter(
+            aiJoinDir,
+            new IndexWriterConfig()
+                .setMergePolicy(NoMergePolicy.INSTANCE)
+                .setMergeScheduler(NoMergeScheduler.INSTANCE));
+    writeAJoinIndex(writer, fromReader, fromField, toReader, toField);
+    return writer;
   }
 }
