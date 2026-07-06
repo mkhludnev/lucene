@@ -20,7 +20,6 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
-
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.column.Column;
 import org.apache.lucene.document.column.LongColumn;
@@ -42,9 +41,9 @@ import org.apache.lucene.util.StringHelper;
 
 /**
  * Column-building and addressing helpers for the auxiliary join index managed by {@link
- * AIJoinIndex}: for every (from-segment, to-segment) pair it produces a SORTED_NUMERIC column
- * named {@link #pairFieldName}, whose doc number is the from-side doc id and whose value is the
- * to-side doc id whose {@code toField} term equals the from doc's {@code fromField} term, plus two
+ * AIJoinIndex}: for every (from-segment, to-segment) pair it produces a SORTED_NUMERIC column named
+ * {@link #pairFieldName}, whose doc number is the from-side doc id and whose value is the to-side
+ * doc id whose {@code toField} term equals the from doc's {@code fromField} term, plus two
  * companion edges columns persisting the pair's {min, max} from-doc and to-doc bounds.
  */
 final class AIJoinUtil {
@@ -61,7 +60,6 @@ final class AIJoinUtil {
     toDocsFieldType.setDocValuesType(DocValuesType.SORTED_NUMERIC);
     toDocsFieldType.freeze();
   }
-
 
   private AIJoinUtil() {}
 
@@ -118,7 +116,7 @@ final class AIJoinUtil {
         toDoc = toDV.nextDoc()) {
       for (int i = 0; i < toDV.docValueCount(); i++) {
         long toOrd = toDV.nextOrd();
-        toDocByToOrd[(int)toOrd] = toDoc;
+        toDocByToOrd[(int) toOrd] = toDoc;
       }
     }
 
@@ -154,23 +152,24 @@ final class AIJoinUtil {
     return List.of(
         ordMapBatch(
             pairFieldName,
-            //fromContext, fromDV, toContext, toDV,
+            // fromContext, fromDV, toContext, toDV,
             toDocByFromDoc),
-        edgesColumn(pairFieldName + FROM_EDGES_SUFFIX, new int[]{minFromDoc,maxFromDoc}),
-        edgesColumn(pairFieldName + TO_EDGES_SUFFIX, new int[]{minToDoc,maxToDoc})
-      );
+        edgesColumn(pairFieldName + FROM_EDGES_SUFFIX, new int[] {minFromDoc, maxFromDoc}),
+        edgesColumn(pairFieldName + TO_EDGES_SUFFIX, new int[] {minToDoc, maxToDoc}));
   }
 
   private static LongColumn edgesColumn(String fromEdgesFieldName, int[] fromDocEdges) {
-    return new LongColumn(fromEdgesFieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
+    return new LongColumn(
+        fromEdgesFieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
       @Override
       public LongTupleCursor tuples() {
         return new LongTupleCursor() {
-          int i=-1;
+          int i = -1;
+
           @Override
           public int nextDoc() {
-            if (++i<fromDocEdges.length) {
-              return 0; //try to put both vals at the doc 0
+            if (++i < fromDocEdges.length) {
+              return 0; // try to put both vals at the doc 0
             }
             return DocIdSetIterator.NO_MORE_DOCS;
           }
@@ -184,9 +183,14 @@ final class AIJoinUtil {
     };
   }
 
-  /** The join index field name addressing the ordinal map of one (from-segment, to-segment) pair. */
+  /**
+   * The join index field name addressing the ordinal map of one (from-segment, to-segment) pair.
+   */
   static String pairFieldName(
-      LeafReaderContext fromContext, String fromField, LeafReaderContext toContext, String toField) {
+      LeafReaderContext fromContext,
+      String fromField,
+      LeafReaderContext toContext,
+      String toField) {
     return getSideKey(fromContext, fromField) + "_" + getSideKey(toContext, toField);
   }
 
@@ -195,8 +199,7 @@ final class AIJoinUtil {
    * SORTED_NUMERIC docvalue is the matching to-side doc id. From docs without a match keep -1 in
    * the array and get no value, hence the column is sparse.
    */
-  static Column ordMapBatch(String fieldName,
-     int[] toDocByFromDoc) {
+  static Column ordMapBatch(String fieldName, int[] toDocByFromDoc) {
 
     Column column =
         new LongColumn(fieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
@@ -208,7 +211,7 @@ final class AIJoinUtil {
               @Override
               public int nextDoc() {
                 while (++fromDoc < toDocByFromDoc.length) {
-                  if (toDocByFromDoc[fromDoc] >=0) {
+                  if (toDocByFromDoc[fromDoc] >= 0) {
                     return fromDoc;
                   }
                 }

@@ -16,6 +16,7 @@
  */
 package org.apache.lucene.sandbox.aijoin;
 
+import com.carrotsearch.randomizedtesting.generators.RandomPicks;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -25,7 +26,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.function.UnaryOperator;
-
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.SortedSetDocValuesField;
@@ -49,8 +49,6 @@ import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.IOUtils;
-
-import com.carrotsearch.randomizedtesting.generators.RandomPicks;
 
 /**
  * Joins a children index to a parents index with {@link JoinUtil}. Children reference parents via a
@@ -252,7 +250,6 @@ public class TestAIJoin extends LuceneTestCase {
     }
   }
 
-
   public void testAIJoinRandomChildrenSubset() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
       try (IndexReader childrenReader = indices.childrenWriter.getReader();
@@ -277,6 +274,7 @@ public class TestAIJoin extends LuceneTestCase {
       indices.colorByParentId.put(newParentId, newParentColor);
       indices.parentsWriter.addDocument(parentDoc(newParentId, newParentColor));
       String newChildId = "childNew";
+      String oldChildId = RandomPicks.randomFrom(random(), indices.parentIdByChildId.keySet());
       indices.parentIdByChildId.put(newChildId, newParentId);
       indices.childrenWriter.addDocument(childDoc(newChildId, newParentId));
       indices.parentsWriter.commit();
@@ -289,10 +287,17 @@ public class TestAIJoin extends LuceneTestCase {
                 newSearcher(parentsReader),
                 new TermQuery(new Term(ID, newChildId)),
                 newSearcher(childrenReader)));
+
+        // one query spanning old and new children joins to their old and new parents
+        assertEquals(
+            Set.of(indices.parentIdByChildId.get(oldChildId), newParentId),
+            searchParentIdsBothJoins(
+                newSearcher(parentsReader),
+                anyOfChildren(new TreeSet<>(List.of(oldChildId, newChildId))),
+                newSearcher(childrenReader)));
       }
     }
   }
-
 
   public void testUpdateChildParentIdFK() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
@@ -397,7 +402,7 @@ public class TestAIJoin extends LuceneTestCase {
     }
   }
 
-    public void testJoinWithParentTermFilter() throws Exception {
+  public void testJoinWithParentTermFilter() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
       try (IndexReader childrenReader = indices.childrenWriter.getReader();
           IndexReader parentsReader = indices.parentsWriter.getReader()) {

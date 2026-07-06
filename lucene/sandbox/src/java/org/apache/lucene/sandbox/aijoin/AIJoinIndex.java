@@ -25,7 +25,6 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
-
 import org.apache.lucene.document.column.Column;
 import org.apache.lucene.document.column.ColumnBatch;
 import org.apache.lucene.index.DocValues;
@@ -67,6 +66,7 @@ public final class AIJoinIndex implements Closeable {
   private final Directory directory;
   private final IndexWriter writer;
   private final SearcherManager manager;
+
   /**
    * Dedups concurrent builders per pair field name: the thread that installs the future writes the
    * pair, others wait on it. Completed futures stay put so a builder that raced a not-yet-visible

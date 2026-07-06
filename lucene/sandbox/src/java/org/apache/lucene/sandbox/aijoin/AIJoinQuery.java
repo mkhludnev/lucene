@@ -22,7 +22,6 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
@@ -47,11 +46,11 @@ import org.apache.lucene.util.FixedBitSet;
 /**
  * Joins the from-side index to the to-side index this query is executed against, resolving
  * from-side docs matching {@code fromQuery} to to-side docs through the auxiliary join index
- * managed by {@link AIJoinIndex}: there, each (from-segment, to-segment) pair owns a
- * SORTED_NUMERIC column named by both sides' persistent keys, whose doc number is the from-side
- * doc id and whose value is the matching to-side doc id. Pair columns missing from the join index
- * are built on demand at weight creation, so no explicit build step exists; obtain instances via
- * {@link AIJoinIndex#newJoinQuery}. Matches score a constant.
+ * managed by {@link AIJoinIndex}: there, each (from-segment, to-segment) pair owns a SORTED_NUMERIC
+ * column named by both sides' persistent keys, whose doc number is the from-side doc id and whose
+ * value is the matching to-side doc id. Pair columns missing from the join index are built on
+ * demand at weight creation, so no explicit build step exists; obtain instances via {@link
+ * AIJoinIndex#newJoinQuery}. Matches score a constant.
  */
 class AIJoinQuery extends Query {
 
@@ -61,15 +60,23 @@ class AIJoinQuery extends Query {
     private final ScoreMode scoreMode;
     private final float boost;
     private final IndexReader toReader;
+
     /**
      * [toSegmentOrd][fromSegmentOrd] -> the pair column resolved at construction time; null where
-     * the from segment has no cached matches, the pair maps no from-side values, or no cached
-     * match falls into the pair's from-doc range. Pair columns record the sidecar segment name,
-     * not a leaf context, so they stay valid across join reader refreshes.
+     * the from segment has no cached matches, the pair maps no from-side values, or no cached match
+     * falls into the pair's from-doc range. Pair columns record the sidecar segment name, not a
+     * leaf context, so they stay valid across join reader refreshes.
      */
     private final PairColumn[][] pairColumnsByTo;
 
-    private AIJoinWeight(Query query, BitSet[] fromMatches, IndexReader fromReader, IndexReader toReader, ScoreMode scoreMode, float boost) throws IOException {
+    private AIJoinWeight(
+        Query query,
+        BitSet[] fromMatches,
+        IndexReader fromReader,
+        IndexReader toReader,
+        ScoreMode scoreMode,
+        float boost)
+        throws IOException {
       super(query);
       this.fromMatches = fromMatches;
       this.fromReader = fromReader;
@@ -146,8 +153,7 @@ class AIJoinQuery extends Query {
                     ? fromBits.nextSetBit(minFromDoc)
                     : DocIdSetIterator.NO_MORE_DOCS;
             if (firstMatch != DocIdSetIterator.NO_MORE_DOCS && firstMatch <= maxFromDoc) {
-              int[] toDocEdges =
-                  loadEdges(joinContext, pairFieldName + AIJoinUtil.TO_EDGES_SUFFIX);
+              int[] toDocEdges = loadEdges(joinContext, pairFieldName + AIJoinUtil.TO_EDGES_SUFFIX);
               pairColumnsByTo[position[0]][fromContextOrd] =
                   new PairColumn(pairFieldName, segmentName, toDocEdges[0], toDocEdges[1]);
             }
@@ -179,167 +185,164 @@ class AIJoinQuery extends Query {
 
     @Override
     public Explanation explain(LeafReaderContext context, int doc) throws IOException {
-        ScorerSupplier supplier = scorerSupplier(context);
-        if (supplier != null) {
-            Scorer scorer = supplier.get(1);
-            if (scorer.iterator().advance(doc) == doc) {
-                return Explanation.match(scorer.score(), AIJoinQuery.this.toString());
-            }
+      ScorerSupplier supplier = scorerSupplier(context);
+      if (supplier != null) {
+        Scorer scorer = supplier.get(1);
+        if (scorer.iterator().advance(doc) == doc) {
+          return Explanation.match(scorer.score(), AIJoinQuery.this.toString());
         }
-        return Explanation.noMatch(AIJoinQuery.this.toString());
+      }
+      return Explanation.noMatch(AIJoinQuery.this.toString());
     }
 
     @Override
     public int count(LeafReaderContext context) throws IOException {
-        // cost() is a range-size upper bound, not an exact match count, so counting has to
-        // fall back to actually driving the two-phase iterator
-        return super.count(context);
+      // cost() is a range-size upper bound, not an exact match count, so counting has to
+      // fall back to actually driving the two-phase iterator
+      return super.count(context);
     }
 
     @Override
     public ScorerSupplier scorerSupplier(LeafReaderContext tolrc) throws IOException {
-        PairColumn[] pairColumns = pairColumnsByTo[tolrc.ord];
-        // first pass: union the contributing pairs' to-doc ranges; every possible match in this
-        // to segment falls into [minToDoc, maxToDoc]
-        int minToDoc = DocIdSetIterator.NO_MORE_DOCS;
-        int maxToDoc = -1;
-        long matchedFromDocsCount = 0;
-        for (int fromOrd = 0; fromOrd < pairColumns.length; fromOrd++) {
-            if (pairColumns[fromOrd] != null) {
-                minToDoc = Math.min(minToDoc, pairColumns[fromOrd].minToDoc());
-                maxToDoc = Math.max(maxToDoc, pairColumns[fromOrd].maxToDoc());
-                matchedFromDocsCount += fromMatches[fromOrd].approximateCardinality();
-            }
+      PairColumn[] pairColumns = pairColumnsByTo[tolrc.ord];
+      // first pass: union the contributing pairs' to-doc ranges; every possible match in this
+      // to segment falls into [minToDoc, maxToDoc]
+      int minToDoc = DocIdSetIterator.NO_MORE_DOCS;
+      int maxToDoc = -1;
+      long matchedFromDocsCount = 0;
+      for (int fromOrd = 0; fromOrd < pairColumns.length; fromOrd++) {
+        if (pairColumns[fromOrd] != null) {
+          minToDoc = Math.min(minToDoc, pairColumns[fromOrd].minToDoc());
+          maxToDoc = Math.max(maxToDoc, pairColumns[fromOrd].maxToDoc());
+          matchedFromDocsCount += fromMatches[fromOrd].approximateCardinality();
         }
-        if (maxToDoc < 0) {
-            // no from segment contributes to this to segment
-            return null;
+      }
+      if (maxToDoc < 0) {
+        // no from segment contributes to this to segment
+        return null;
+      }
+      final int firstToDoc = minToDoc;
+      final int lastToDoc = maxToDoc;
+      // the first matches() call sweeps every matched from doc to materialize the mapping;
+      // later calls are a bitset lookup
+      final float matchCost = matchedFromDocsCount;
+      return new ScorerSupplier() {
+        @Override
+        public Scorer get(long leadCost) throws IOException {
+          FixedBitSet rangeBits = new FixedBitSet(lastToDoc + 1);
+          rangeBits.set(firstToDoc, lastToDoc + 1);
+          DocIdSetIterator approximation =
+              new BitSetIterator(rangeBits, lastToDoc - firstToDoc + 1);
+          TwoPhaseIterator twoPhase =
+              new TwoPhaseIterator(approximation) {
+                boolean pruned = false;
+
+                @Override
+                public boolean matches() throws IOException {
+                  if (!pruned) {
+                    FixedBitSet matchedToDocs;
+                    int shift;
+                    // prune the approximation to the resolved matches: drop the
+                    // remaining range bits and or the matches back in at their
+                    // absolute positions, so the approximation stops visiting
+                    // non-matching docs
+                    shift = approximation.docID();
+                    matchedToDocs = resolveMatchedToDocs(pairColumns, shift, lastToDoc);
+                    rangeBits.clear(shift, lastToDoc + 1);
+                    FixedBitSet.orRange(matchedToDocs, 0, rangeBits, shift, lastToDoc - shift + 1);
+                    pruned = true;
+                    return rangeBits.get(approximation.docID());
+                  }
+                  // the bitset spans [shift, lastToDoc] shifted to zero
+                  // return matchedToDocs.get(approximation.docID() - shift);
+                  assert /*return*/ rangeBits.get(approximation.docID()); // always true ??
+                  return true;
+                }
+
+                @Override
+                public float matchCost() {
+                  return matchCost;
+                }
+              };
+          return new ConstantScoreScorer(boost, scoreMode, twoPhase);
         }
-        final int firstToDoc = minToDoc;
-        final int lastToDoc = maxToDoc;
-        // the first matches() call sweeps every matched from doc to materialize the mapping;
-        // later calls are a bitset lookup
-        final float matchCost = matchedFromDocsCount;
-        return new ScorerSupplier() {
-            @Override
-            public Scorer get(long leadCost) throws IOException {
-                FixedBitSet rangeBits = new FixedBitSet(lastToDoc + 1);
-                rangeBits.set(firstToDoc, lastToDoc + 1);
-                DocIdSetIterator approximation =
-                    new BitSetIterator(rangeBits, lastToDoc - firstToDoc + 1);
-                TwoPhaseIterator twoPhase =
-                    new TwoPhaseIterator(approximation) {
-                        boolean pruned = false;
 
-                        @Override
-                        public boolean matches() throws IOException {
-                          if(!pruned) {
-                            FixedBitSet matchedToDocs;
-                            int shift;
-                            // prune the approximation to the resolved matches: drop the
-                            // remaining range bits and or the matches back in at their
-                            // absolute positions, so the approximation stops visiting
-                            // non-matching docs
-                            shift = approximation.docID();
-                            matchedToDocs =
-                                resolveMatchedToDocs(pairColumns, shift, lastToDoc);
-                            rangeBits.clear(shift, lastToDoc + 1);
-                            FixedBitSet.orRange(
-                                matchedToDocs, 0, rangeBits, shift, lastToDoc - shift + 1);
-                            pruned = true;
-                            return rangeBits.get(approximation.docID());
-                          }
-                          // the bitset spans [shift, lastToDoc] shifted to zero
-                          //return matchedToDocs.get(approximation.docID() - shift);
-                          assert/*return*/ rangeBits.get(approximation.docID());// always true ??
-                          return true;
-                        }
-
-                        @Override
-                        public float matchCost() {
-                            return matchCost;
-                        }
-                    };
-                return new ConstantScoreScorer(boost, scoreMode, twoPhase);
-            }
-
-            @Override
-            public long cost() {
-                return lastToDoc - firstToDoc + 1;
-            }
-        };
+        @Override
+        public long cost() {
+          return lastToDoc - firstToDoc + 1;
+        }
+      };
     }
 
     /**
-     * Second phase of the join: unions the to-side doc ids mapped from every matched from doc.
-     * The returned bitset spans only [minToDoc, maxToDoc], with minToDoc shifted to bit 0;
-     * matches mapped below minToDoc are dropped, so the caller must never look them up.
+     * Second phase of the join: unions the to-side doc ids mapped from every matched from doc. The
+     * returned bitset spans only [minToDoc, maxToDoc], with minToDoc shifted to bit 0; matches
+     * mapped below minToDoc are dropped, so the caller must never look them up.
      *
      * <p>All join index reads happen within one acquire/release bracket: the join reader may have
      * been refreshed since weight creation, so each pair column is re-resolved by sidecar segment
      * name in the freshly acquired reader.
      */
-    private FixedBitSet resolveMatchedToDocs(
-        PairColumn[] pairColumns, int minToDoc, int maxToDoc) throws IOException {
-        FixedBitSet matchedToDocs = new FixedBitSet(maxToDoc - minToDoc + 1);
-        IndexSearcher joinSearcher = joinIndex.acquire();
-        try {
-            Map<String, LeafReaderContext> joinLeavesBySegment = new HashMap<>();
-            for (LeafReaderContext joinContext : joinSearcher.getIndexReader().leaves()) {
-                joinLeavesBySegment.put(AIJoinIndex.segmentName(joinContext), joinContext);
-            }
-            for (int fromOrd = 0; fromOrd < pairColumns.length; fromOrd++) {
-                PairColumn pairColumn = pairColumns[fromOrd];
-                if (pairColumn == null) {
-                    // this from segment cannot contribute to this to segment
-                    continue;
-                }
-                LeafReaderContext joinContext =
-                    joinLeavesBySegment.get(pairColumn.joinSegmentName());
-                if (joinContext == null) {
-                    // the join index is append-only: a resolved pair references live side
-                    // segments, whose sidecar segments reaping must never drop
-                    throw new IllegalStateException(
-                        "join index segment ["
-                            + pairColumn.joinSegmentName()
-                            + "] carrying pair ["
-                            + pairColumn.pairFieldName()
-                            + "] disappeared");
-                }
-                BitSet matches = fromMatches[fromOrd];
-                SortedNumericDocValues toDocsByFromDoc =
-                    joinContext.reader().getSortedNumericDocValues(pairColumn.pairFieldName());
-                BitSetIterator matchedFromDocs =
-                    new BitSetIterator(matches, matches.approximateCardinality());
-                for (int fromDoc = matchedFromDocs.nextDoc();
-                    fromDoc != DocIdSetIterator.NO_MORE_DOCS;
-                    fromDoc = matchedFromDocs.nextDoc()) {
-
-                    if (toDocsByFromDoc.advanceExact(fromDoc)) {
-                        for (int i = 0; i < toDocsByFromDoc.docValueCount(); i++) {
-                            int toDocMatch = (int) toDocsByFromDoc.nextValue();
-                            if (toDocMatch >= minToDoc) {
-                              // matches below minToDoc (including the -1 no-match marker) are
-                              // unreachable and dropped
-                              assert toDocMatch <= maxToDoc
-                                  : "to doc " + toDocMatch + " above edges union max " + maxToDoc;
-                              matchedToDocs.set(toDocMatch - minToDoc);
-                            }
-                        }
-                    }
-                }
-            }
-        } finally {
-            joinIndex.release(joinSearcher);
+    private FixedBitSet resolveMatchedToDocs(PairColumn[] pairColumns, int minToDoc, int maxToDoc)
+        throws IOException {
+      FixedBitSet matchedToDocs = new FixedBitSet(maxToDoc - minToDoc + 1);
+      IndexSearcher joinSearcher = joinIndex.acquire();
+      try {
+        Map<String, LeafReaderContext> joinLeavesBySegment = new HashMap<>();
+        for (LeafReaderContext joinContext : joinSearcher.getIndexReader().leaves()) {
+          joinLeavesBySegment.put(AIJoinIndex.segmentName(joinContext), joinContext);
         }
-        return matchedToDocs;
+        for (int fromOrd = 0; fromOrd < pairColumns.length; fromOrd++) {
+          PairColumn pairColumn = pairColumns[fromOrd];
+          if (pairColumn == null) {
+            // this from segment cannot contribute to this to segment
+            continue;
+          }
+          LeafReaderContext joinContext = joinLeavesBySegment.get(pairColumn.joinSegmentName());
+          if (joinContext == null) {
+            // the join index is append-only: a resolved pair references live side
+            // segments, whose sidecar segments reaping must never drop
+            throw new IllegalStateException(
+                "join index segment ["
+                    + pairColumn.joinSegmentName()
+                    + "] carrying pair ["
+                    + pairColumn.pairFieldName()
+                    + "] disappeared");
+          }
+          BitSet matches = fromMatches[fromOrd];
+          SortedNumericDocValues toDocsByFromDoc =
+              joinContext.reader().getSortedNumericDocValues(pairColumn.pairFieldName());
+          BitSetIterator matchedFromDocs =
+              new BitSetIterator(matches, matches.approximateCardinality());
+          for (int fromDoc = matchedFromDocs.nextDoc();
+              fromDoc != DocIdSetIterator.NO_MORE_DOCS;
+              fromDoc = matchedFromDocs.nextDoc()) {
+
+            if (toDocsByFromDoc.advanceExact(fromDoc)) {
+              for (int i = 0; i < toDocsByFromDoc.docValueCount(); i++) {
+                int toDocMatch = (int) toDocsByFromDoc.nextValue();
+                if (toDocMatch >= minToDoc) {
+                  // matches below minToDoc (including the -1 no-match marker) are
+                  // unreachable and dropped
+                  assert toDocMatch <= maxToDoc
+                      : "to doc " + toDocMatch + " above edges union max " + maxToDoc;
+                  matchedToDocs.set(toDocMatch - minToDoc);
+                }
+              }
+            }
+          }
+        }
+      } finally {
+        joinIndex.release(joinSearcher);
+      }
+      return matchedToDocs;
     }
 
     @Override
     public boolean isCacheable(LeafReaderContext lrc) {
-        // matches depend on the from-side searcher and the external join index, which the
-        // query cache cannot see
-        return false;
+      // matches depend on the from-side searcher and the external join index, which the
+      // query cache cannot see
+      return false;
     }
   }
 
@@ -347,9 +350,8 @@ class AIJoinQuery extends Query {
    * One (from-segment, to-segment) pair's ordinal-map column: its field name and the name of the
    * sidecar segment carrying it, so the column survives join reader refreshes.
    */
-  private record PairColumn(String pairFieldName, String joinSegmentName,
-    int minToDoc, int maxToDoc
-  ) {}
+  private record PairColumn(
+      String pairFieldName, String joinSegmentName, int minToDoc, int maxToDoc) {}
 
   private final AIJoinIndex joinIndex;
   private final String fromField;
@@ -370,7 +372,6 @@ class AIJoinQuery extends Query {
     this.toField = Objects.requireNonNull(toField, "toField");
   }
 
-
   @Override
   public Query rewrite(IndexSearcher indexSearcher) throws IOException {
     // the from-side selection rewrites against the from-side searcher, not against the (to-side)
@@ -383,13 +384,12 @@ class AIJoinQuery extends Query {
   }
 
   @Override
-  public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
+  public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost)
+      throws IOException {
     // run the from-side selection once per weight and cache its matches as one bitset per from
     // segment; from segments without matches keep null
     IndexReader fromReader = fromSearcher.getIndexReader();
-    Weight fromWeight =
-        fromSearcher.createWeight(
-      fromQuery, ScoreMode.COMPLETE_NO_SCORES, 1f);
+    Weight fromWeight = fromSearcher.createWeight(fromQuery, ScoreMode.COMPLETE_NO_SCORES, 1f);
     BitSet[] fromMatches = new BitSet[fromReader.leaves().size()];
     for (LeafReaderContext fromContext : fromReader.leaves()) {
       ScorerSupplier supplier = fromWeight.scorerSupplier(fromContext);
@@ -408,13 +408,12 @@ class AIJoinQuery extends Query {
                 }
               };
         }
-        fromMatches[fromContext.ord] =
-            BitSet.of(iterator, fromContext.reader().maxDoc());
+        fromMatches[fromContext.ord] = BitSet.of(iterator, fromContext.reader().maxDoc());
       }
     }
-    return new AIJoinWeight(this, fromMatches, fromReader, searcher.getIndexReader(), scoreMode, boost);
+    return new AIJoinWeight(
+        this, fromMatches, fromReader, searcher.getIndexReader(), scoreMode, boost);
   }
-
 
   @Override
   public String toString(String field) {

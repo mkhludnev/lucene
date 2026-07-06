@@ -18,7 +18,6 @@ package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
 import java.util.Locale;
-
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.SortedDocValuesField;
@@ -40,7 +39,6 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.analysis.MockAnalyzer;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.IOUtils;
 
 /**
  * Wall-clock comparison of {@link JoinUtil} (the term-based variant, no global ordinals) against
@@ -48,14 +46,21 @@ import org.apache.lucene.util.IOUtils;
  * unique parents in a few segments through single valued sorted string docvalues. A small
  * child-side term filter selects ~10K children that join to ~1K parents; a second case adds a
  * parent-side filter on top of the join. Results are not asserted, only timed: each search repeats
- * {@link #PASSES} times and min/max/avg wall times are printed. The indices are never updated
- * after the build, and the {@link AIJoinIndex} is opened once and reused between passes: its pair
- * columns are built lazily by the first search, which is timed separately.
+ * {@link #PASSES} times and min/max/avg wall times are printed.
+ *
+ * <p>The whole comparison runs {@link #ROUNDS} times over a growing, mutating index: between rounds
+ * the parent id boundary is raised by 10% and a tenth of the (new) parent population, with all
+ * their children, is rewritten through {@code updateDocument} at random ids below the new boundary
+ * — ids above the old boundary append fresh docs while ids below it clash with existing ones and
+ * replace them, leaving deletes behind. The {@link AIJoinIndex} is opened once and reused by every
+ * round and pass: after each update the first search builds only the missing pair columns, which is
+ * timed separately from the steady-state passes.
  */
 public class TestAIJoinBenchmark extends LuceneTestCase {
 
   private static final String PARENT_ID = "parent_id";
   private static final String PARENT_ID_FK = "parent_id_FK";
+  private static final String CHILD_ID = "child_id";
   private static final String TAG = "tag";
   private static final String COLOR = "color";
 
@@ -73,77 +78,96 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
   private static final int PARENT_SEGMENTS = 4;
   private static final int CHILD_SEGMENTS = 5;
   private static final int PASSES = 10;
+  // benchmark rounds: between rounds the parent boundary grows by GROWTH_DENOMINATOR'th and
+  // 1/UPDATE_DENOMINATOR of the grown population is rewritten at random ids below the new boundary
+  private static final int ROUNDS = 10;
+  private static final int GROWTH_DENOMINATOR = 10;
+  private static final int UPDATE_DENOMINATOR = 10;
 
   private interface SearchTask {
     TopDocs run() throws IOException;
   }
 
   public void testBenchmarkJoins() throws Exception {
+    // the auxiliary join index is opened once and reused by every round and pass; open() took
+    // ownership of the sidecar directory, so closing the join index closes it too
     try (Directory parentsDir = newDirectory();
-        Directory childrenDir = newDirectory()) {
+        Directory childrenDir = newDirectory();
+        AIJoinIndex joinIndex = AIJoinIndex.open(newDirectory())) {
       buildIndices(parentsDir, childrenDir);
-      try (IndexReader parentsReader = DirectoryReader.open(parentsDir);
-          IndexReader childrenReader = DirectoryReader.open(childrenDir)) {
-        System.out.printf(
-            Locale.ROOT,
-            "parents: %d docs / %d segments, children: %d docs / %d segments%n",
-            parentsReader.maxDoc(),
-            parentsReader.leaves().size(),
-            childrenReader.maxDoc(),
-            childrenReader.leaves().size());
-        // plain searchers without caching: AIJoinQuery is uncacheable anyway, so a cached
-        // JoinUtil query would make the comparison lopsided
-        IndexSearcher childrenSearcher = new IndexSearcher(childrenReader);
-        childrenSearcher.setQueryCache(null);
-        IndexSearcher parentsSearcher = new IndexSearcher(parentsReader);
-        parentsSearcher.setQueryCache(null);
-
-        Query childFilter = new TermQuery(new Term(TAG, HOT));
-        Query parentFilter = new TermQuery(new Term(COLOR, color(0)));
-
-        // the auxiliary join index is opened once and reused by all passes; the first search
-        // builds all pair columns lazily, so it's timed apart from the steady-state passes
-        AIJoinIndex joinIndex = AIJoinIndex.open(newDirectory());
-        long buildStart = System.nanoTime();
-        parentsSearcher.search(
-            aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher), 10);
-        System.out.printf(
-            Locale.ROOT,
-            "AI join first search (lazy pair build): %.2fms%n",
-            (System.nanoTime() - buildStart) / 1_000_000d);
-
-        // join query creation is inside the timed task on purpose: JoinUtil runs the from-side
-        // selection eagerly in createJoinQuery, AIJoinQuery lazily in createWeight, so only
-        // create+search is comparable
-        bench(
-            "JoinUtil",
-            () ->
-                parentsSearcher.search(
-                    joinChildrenToParents(childFilter, childrenSearcher), 10));
-        bench(
-            "AIJoin",
-            () ->
-                parentsSearcher.search(
-                    aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher), 10));
-        bench(
-            "JoinUtil + parent filter",
-            () ->
-                parentsSearcher.search(
-                    filterParents(
-                        joinChildrenToParents(childFilter, childrenSearcher), parentFilter),
-                    10));
-        bench(
-            "AIJoin + parent filter",
-            () ->
-                parentsSearcher.search(
-                    filterParents(
-                        aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher),
-                        parentFilter),
-                    10));
-
-        // open() took ownership of the sidecar directory, so this closes it too
-        IOUtils.close(joinIndex);
+      int numParents = NUM_PARENTS;
+      for (int round = 0; round < ROUNDS; round++) {
+        benchmarkRound(round, numParents, parentsDir, childrenDir, joinIndex);
+        if (round < ROUNDS - 1) {
+          numParents += numParents / GROWTH_DENOMINATOR;
+          updateIndices(parentsDir, childrenDir, numParents);
+        }
       }
+    }
+  }
+
+  private void benchmarkRound(
+      int round, int numParents, Directory parentsDir, Directory childrenDir, AIJoinIndex joinIndex)
+      throws IOException {
+    try (IndexReader parentsReader = DirectoryReader.open(parentsDir);
+        IndexReader childrenReader = DirectoryReader.open(childrenDir)) {
+      System.out.printf(
+          Locale.ROOT,
+          "round %d: parent ids < %d, parents: %d/%d docs (live/max) / %d segments,"
+              + " children: %d/%d docs (live/max) / %d segments%n",
+          round,
+          numParents,
+          parentsReader.numDocs(),
+          parentsReader.maxDoc(),
+          parentsReader.leaves().size(),
+          childrenReader.numDocs(),
+          childrenReader.maxDoc(),
+          childrenReader.leaves().size());
+      // plain searchers without caching: AIJoinQuery is uncacheable anyway, so a cached
+      // JoinUtil query would make the comparison lopsided
+      IndexSearcher childrenSearcher = new IndexSearcher(childrenReader);
+      childrenSearcher.setQueryCache(null);
+      IndexSearcher parentsSearcher = new IndexSearcher(parentsReader);
+      parentsSearcher.setQueryCache(null);
+
+      Query childFilter = new TermQuery(new Term(TAG, HOT));
+      Query parentFilter = new TermQuery(new Term(COLOR, color(0)));
+
+      // the first search after a reopen builds the missing pair columns lazily (all of them in
+      // round 0, only the new segments' pairs later), so it's timed apart from the steady-state
+      // passes
+      long buildStart = System.nanoTime();
+      parentsSearcher.search(aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher), 10);
+      System.out.printf(
+          Locale.ROOT,
+          "AI join first search (lazy pair build): %.2fms%n",
+          (System.nanoTime() - buildStart) / 1_000_000d);
+
+      // join query creation is inside the timed task on purpose: JoinUtil runs the from-side
+      // selection eagerly in createJoinQuery, AIJoinQuery lazily in createWeight, so only
+      // create+search is comparable
+      bench(
+          "JoinUtil",
+          () -> parentsSearcher.search(joinChildrenToParents(childFilter, childrenSearcher), 10));
+      bench(
+          "AIJoin",
+          () ->
+              parentsSearcher.search(
+                  aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher), 10));
+      bench(
+          "JoinUtil + parent filter",
+          () ->
+              parentsSearcher.search(
+                  filterParents(joinChildrenToParents(childFilter, childrenSearcher), parentFilter),
+                  10));
+      bench(
+          "AIJoin + parent filter",
+          () ->
+              parentsSearcher.search(
+                  filterParents(
+                      aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher),
+                      parentFilter),
+                  10));
     }
   }
 
@@ -195,54 +219,24 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
   }
 
   /**
-   * Writes the two sides with plain {@link IndexWriter}s: every child points to exactly one
-   * parent, {@code parent_id} is unique on the parents side, both join fields are single valued
-   * sorted string docvalues, and periodic commits under {@link NoMergePolicy} leave each side in a
-   * few segments.
+   * Writes the two sides with plain {@link IndexWriter}s: every child points to exactly one parent,
+   * {@code parent_id} is unique on the parents side, {@code child_id} is unique on the children
+   * side, both join fields are single valued sorted string docvalues, and periodic commits under
+   * {@link NoMergePolicy} leave each side in a few segments.
    */
   private void buildIndices(Directory parentsDir, Directory childrenDir) throws IOException {
-    try (IndexWriter parentsWriter =
-            new IndexWriter(
-                parentsDir,
-                newIndexWriterConfig(new MockAnalyzer(random()))
-                    .setMergePolicy(NoMergePolicy.INSTANCE)
-                    // pin the flush triggers: the randomized test config may pick tiny buffers
-                    // and shatter the intended segment layout
-                    .setMaxBufferedDocs(IndexWriter.MAX_DOCS)
-                    .setRAMBufferSizeMB(256));
-        IndexWriter childrenWriter =
-            new IndexWriter(
-                childrenDir,
-                newIndexWriterConfig(new MockAnalyzer(random()))
-                    .setMergePolicy(NoMergePolicy.INSTANCE)
-                    // pin the flush triggers: the randomized test config may pick tiny buffers
-                    // and shatter the intended segment layout
-                    .setMaxBufferedDocs(IndexWriter.MAX_DOCS)
-                    .setRAMBufferSizeMB(256))) {
+    try (IndexWriter parentsWriter = newBenchWriter(parentsDir);
+        IndexWriter childrenWriter = newBenchWriter(childrenDir)) {
       int parentsPerSegment = NUM_PARENTS / PARENT_SEGMENTS;
       int childrenPerSegment = NUM_PARENTS * CHILDREN_PER_PARENT / CHILD_SEGMENTS;
       int childSeq = 0;
       for (int p = 0; p < NUM_PARENTS; p++) {
-        String parentId = "parent" + p;
-        boolean hot = p % HOT_STRIDE == 0;
-
-        Document parentDoc = new Document();
-        parentDoc.add(new StringField(PARENT_ID, parentId, Field.Store.NO));
-        parentDoc.add(new SortedDocValuesField(PARENT_ID, new BytesRef(parentId)));
-        // cycle colors by hot rank, not by p: a plain p % COLOR_CARDINALITY would correlate with
-        // the p % HOT_STRIDE hot selection and the filter wouldn't thin the joined parents
-        parentDoc.add(
-            new StringField(COLOR, color((p / HOT_STRIDE) % COLOR_CARDINALITY), Field.Store.NO));
-        parentsWriter.addDocument(parentDoc);
+        parentsWriter.addDocument(parentDoc(p));
         if ((p + 1) % parentsPerSegment == 0) {
           parentsWriter.commit();
         }
-
         for (int c = 0; c < CHILDREN_PER_PARENT; c++) {
-          Document childDoc = new Document();
-          childDoc.add(new SortedDocValuesField(PARENT_ID_FK, new BytesRef(parentId)));
-          childDoc.add(new StringField(TAG, hot ? HOT : COLD, Field.Store.NO));
-          childrenWriter.addDocument(childDoc);
+          childrenWriter.addDocument(childDoc(p, c));
           if (++childSeq % childrenPerSegment == 0) {
             childrenWriter.commit();
           }
@@ -251,5 +245,67 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
       parentsWriter.commit();
       childrenWriter.commit();
     }
+  }
+
+  /**
+   * Simulates incremental growth after the boundary was raised to {@code numParents}: rewrites
+   * {@code numParents / }{@link #UPDATE_DENOMINATOR} parents, each with all its children, at random
+   * ids below the new boundary. Ids above the previous boundary append fresh docs; ids below it
+   * clash with existing {@code parent_id}/{@code child_id} terms and {@code updateDocument}
+   * replaces the old docs, leaving deletes behind in the earlier segments. The single closing
+   * commit adds one new segment per side under {@link NoMergePolicy}.
+   */
+  private void updateIndices(Directory parentsDir, Directory childrenDir, int numParents)
+      throws IOException {
+    try (IndexWriter parentsWriter = newBenchWriter(parentsDir);
+        IndexWriter childrenWriter = newBenchWriter(childrenDir)) {
+      for (int i = 0; i < numParents / UPDATE_DENOMINATOR; i++) {
+        int p = random().nextInt(numParents);
+        parentsWriter.updateDocument(new Term(PARENT_ID, parentId(p)), parentDoc(p));
+        for (int c = 0; c < CHILDREN_PER_PARENT; c++) {
+          childrenWriter.updateDocument(new Term(CHILD_ID, childId(p, c)), childDoc(p, c));
+        }
+      }
+      parentsWriter.commit();
+      childrenWriter.commit();
+    }
+  }
+
+  private IndexWriter newBenchWriter(Directory dir) throws IOException {
+    return new IndexWriter(
+        dir,
+        newIndexWriterConfig(new MockAnalyzer(random()))
+            .setMergePolicy(NoMergePolicy.INSTANCE)
+            // pin the flush triggers: the randomized test config may pick tiny buffers
+            // and shatter the intended segment layout
+            .setMaxBufferedDocs(IndexWriter.MAX_DOCS)
+            .setRAMBufferSizeMB(256));
+  }
+
+  private static String parentId(int p) {
+    return "parent" + p;
+  }
+
+  private static String childId(int p, int c) {
+    return "child" + p + "." + c;
+  }
+
+  private static Document parentDoc(int p) {
+    String parentId = parentId(p);
+    Document doc = new Document();
+    doc.add(new StringField(PARENT_ID, parentId, Field.Store.NO));
+    doc.add(new SortedDocValuesField(PARENT_ID, new BytesRef(parentId)));
+    // cycle colors by hot rank, not by p: a plain p % COLOR_CARDINALITY would correlate with
+    // the p % HOT_STRIDE hot selection and the filter wouldn't thin the joined parents
+    doc.add(new StringField(COLOR, color((p / HOT_STRIDE) % COLOR_CARDINALITY), Field.Store.NO));
+    return doc;
+  }
+
+  private static Document childDoc(int p, int c) {
+    Document doc = new Document();
+    doc.add(new StringField(CHILD_ID, childId(p, c), Field.Store.NO));
+    doc.add(new SortedDocValuesField(PARENT_ID_FK, new BytesRef(parentId(p))));
+    doc.add(new StringField(TAG, p % HOT_STRIDE == 0 ? HOT : COLD, Field.Store.NO));
+    return doc;
   }
 }

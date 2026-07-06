@@ -56,6 +56,6 @@ Planned reaping design:
 ## TODO
  - move to join module
  - comparative benchmarking for updates: parent, children field, PARENT_ID_FK
- - garbage collecting
+ - garbage collecting. just call flush every segment.
  - many-to-many: child has many parents refs. parent has many refs_ids
  - reverse join on the same colums: children by parents filter
