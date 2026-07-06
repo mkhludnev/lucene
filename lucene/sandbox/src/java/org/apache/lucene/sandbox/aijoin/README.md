@@ -52,3 +52,10 @@ Planned reaping design:
 - **Fallback.** When dead pairs cannot be isolated per segment (mixed batches written by older
   code), rewrite the sidecar from scratch once the dead-pair ratio crosses a threshold — the
   taxonomy-index `replaceTaxonomy` precedent.
+
+## TODO
+ - move to join module
+ - comparative benchmarking for updates: parent, children field, PARENT_ID_FK
+ - garbage collecting
+ - many-to-many: child has many parents refs. parent has many refs_ids
+ - reverse join on the same colums: children by parents filter
