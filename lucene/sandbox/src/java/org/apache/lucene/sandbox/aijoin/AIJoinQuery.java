@@ -211,7 +211,7 @@ class AIJoinQuery extends Query {
       int maxToDoc = -1;
       long matchedFromDocsCount = 0;
       for (int fromOrd = 0; fromOrd < pairColumns.length; fromOrd++) {
-        if (pairColumns[fromOrd] != null) {
+        if (pairColumns[fromOrd] != null) { // here we can shuffle them, and check whether we have from match on this segement only here
           minToDoc = Math.min(minToDoc, pairColumns[fromOrd].minToDoc());
           maxToDoc = Math.max(maxToDoc, pairColumns[fromOrd].maxToDoc());
           matchedFromDocsCount += fromMatches[fromOrd].approximateCardinality();
@@ -230,7 +230,7 @@ class AIJoinQuery extends Query {
         @Override
         public Scorer get(long leadCost) throws IOException {
           FixedBitSet rangeBits = new FixedBitSet(lastToDoc + 1);
-          rangeBits.set(firstToDoc, lastToDoc + 1);
+          rangeBits.set(firstToDoc, lastToDoc + 1); // drop seperate [minTo maxTo] ranges
           DocIdSetIterator approximation =
               new BitSetIterator(rangeBits, lastToDoc - firstToDoc + 1);
           TwoPhaseIterator twoPhase =

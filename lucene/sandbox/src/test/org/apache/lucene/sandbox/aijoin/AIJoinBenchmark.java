@@ -18,6 +18,9 @@ package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
 import java.util.Locale;
+import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.SortedDocValuesField;
@@ -25,6 +28,7 @@ import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
@@ -33,11 +37,11 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.TopScoreDocCollectorManager;
 import org.apache.lucene.search.join.JoinUtil;
 import org.apache.lucene.search.join.ScoreMode;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.tests.analysis.MockAnalyzer;
-import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.util.BytesRef;
 
 /**
@@ -55,8 +59,10 @@ import org.apache.lucene.util.BytesRef;
  * replace them, leaving deletes behind. The {@link AIJoinIndex} is opened once and reused by every
  * round and pass: after each update the first search builds only the missing pair columns, which is
  * timed separately from the steady-state passes.
+ *
+ * <p>Plain Java benchmark, run directly with {@code main}, no test framework involved.
  */
-public class TestAIJoinBenchmark extends LuceneTestCase {
+public class AIJoinBenchmark {
 
   private static final String PARENT_ID = "parent_id";
   private static final String PARENT_ID_FK = "parent_id_FK";
@@ -69,7 +75,7 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
   // the parent filter matches one of COLOR_CARDINALITY colors, passing ~1/30 of the joined parents
   private static final int COLOR_CARDINALITY = 30;
 
-  private static final int NUM_PARENTS = 10_000;
+  private static final int NUM_PARENTS = 100_000;
   private static final int CHILDREN_PER_PARENT = 10;
   // every HOT_STRIDE'th parent is "hot" and all its children carry the hot tag: the child filter
   // TermQuery(tag:hot) matches NUM_PARENTS / HOT_STRIDE * CHILDREN_PER_PARENT ~ 10K children
@@ -84,20 +90,28 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
   private static final int GROWTH_DENOMINATOR = 10;
   private static final int UPDATE_DENOMINATOR = 10;
 
+  private final Random random = new Random();
+
   private interface SearchTask {
     TopDocs run() throws IOException;
   }
 
-  public void testBenchmarkJoins() throws Exception {
+  public static void main(String[] args) throws Exception {
+    new AIJoinBenchmark().runBenchmark();
+  }
+
+  public void runBenchmark() throws Exception {
     // the auxiliary join index is opened once and reused by every round and pass; open() took
     // ownership of the sidecar directory, so closing the join index closes it too
-    try (Directory parentsDir = newDirectory();
-        Directory childrenDir = newDirectory();
-        AIJoinIndex joinIndex = AIJoinIndex.open(newDirectory())) {
+    try (Directory parentsDir = new ByteBuffersDirectory();
+        Directory childrenDir = new ByteBuffersDirectory();
+        ExecutorService executor =
+            Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        AIJoinIndex joinIndex = AIJoinIndex.open(new ByteBuffersDirectory())) {
       buildIndices(parentsDir, childrenDir);
       int numParents = NUM_PARENTS;
       for (int round = 0; round < ROUNDS; round++) {
-        benchmarkRound(round, numParents, parentsDir, childrenDir, joinIndex);
+        benchmarkRound(round, numParents, parentsDir, childrenDir, joinIndex, executor);
         if (round < ROUNDS - 1) {
           numParents += numParents / GROWTH_DENOMINATOR;
           updateIndices(parentsDir, childrenDir, numParents);
@@ -107,7 +121,12 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
   }
 
   private void benchmarkRound(
-      int round, int numParents, Directory parentsDir, Directory childrenDir, AIJoinIndex joinIndex)
+      int round,
+      int numParents,
+      Directory parentsDir,
+      Directory childrenDir,
+      AIJoinIndex joinIndex,
+      ExecutorService executor)
       throws IOException {
     try (IndexReader parentsReader = DirectoryReader.open(parentsDir);
         IndexReader childrenReader = DirectoryReader.open(childrenDir)) {
@@ -123,11 +142,12 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
           childrenReader.numDocs(),
           childrenReader.maxDoc(),
           childrenReader.leaves().size());
+
       // plain searchers without caching: AIJoinQuery is uncacheable anyway, so a cached
       // JoinUtil query would make the comparison lopsided
-      IndexSearcher childrenSearcher = new IndexSearcher(childrenReader);
+      IndexSearcher childrenSearcher = new ParallelIndexSearcher(childrenReader, executor);
       childrenSearcher.setQueryCache(null);
-      IndexSearcher parentsSearcher = new IndexSearcher(parentsReader);
+      IndexSearcher parentsSearcher = new ParallelIndexSearcher(parentsReader, executor);
       parentsSearcher.setQueryCache(null);
 
       Query childFilter = new TermQuery(new Term(TAG, HOT));
@@ -137,7 +157,8 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
       // round 0, only the new segments' pairs later), so it's timed apart from the steady-state
       // passes
       long buildStart = System.nanoTime();
-      parentsSearcher.search(aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher), 10);
+      exactSearch(
+          parentsSearcher, aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher));
       System.out.printf(
           Locale.ROOT,
           "AI join first search (lazy pair build): %.2fms%n",
@@ -148,26 +169,29 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
       // create+search is comparable
       bench(
           "JoinUtil",
-          () -> parentsSearcher.search(joinChildrenToParents(childFilter, childrenSearcher), 10));
+          () ->
+              exactSearch(parentsSearcher, joinChildrenToParents(childFilter, childrenSearcher)));
       bench(
           "AIJoin",
           () ->
-              parentsSearcher.search(
-                  aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher), 10));
+              exactSearch(
+                  parentsSearcher,
+                  aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher)));
       bench(
           "JoinUtil + parent filter",
           () ->
-              parentsSearcher.search(
-                  filterParents(joinChildrenToParents(childFilter, childrenSearcher), parentFilter),
-                  10));
+              exactSearch(
+                  parentsSearcher,
+                  filterParents(
+                      joinChildrenToParents(childFilter, childrenSearcher), parentFilter)));
       bench(
           "AIJoin + parent filter",
           () ->
-              parentsSearcher.search(
+              exactSearch(
+                  parentsSearcher,
                   filterParents(
                       aiJoinChildrenToParents(joinIndex, childFilter, childrenSearcher),
-                      parentFilter),
-                  10));
+                      parentFilter)));
     }
   }
 
@@ -192,6 +216,16 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
         .add(joinQuery, BooleanClause.Occur.MUST)
         .add(parentFilter, BooleanClause.Occur.FILTER)
         .build();
+  }
+
+  /**
+   * Runs a top-10 search with an uncapped total hits threshold, so {@code totalHits} is always
+   * exact instead of the default two-arg {@code search(query, 10)}'s early-terminated estimate
+   * past 1000 hits: with that default, JoinUtil and AIJoin visit docs in different orders and cost
+   * estimates and stop at different points, making their reported hit counts incomparable.
+   */
+  private static TopDocs exactSearch(IndexSearcher searcher, Query query) throws IOException {
+    return searcher.search(query, new TopScoreDocCollectorManager(10, null, Integer.MAX_VALUE));
   }
 
   private static void bench(String name, SearchTask task) throws IOException {
@@ -260,7 +294,7 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
     try (IndexWriter parentsWriter = newBenchWriter(parentsDir);
         IndexWriter childrenWriter = newBenchWriter(childrenDir)) {
       for (int i = 0; i < numParents / UPDATE_DENOMINATOR; i++) {
-        int p = random().nextInt(numParents);
+        int p = random.nextInt(numParents);
         parentsWriter.updateDocument(new Term(PARENT_ID, parentId(p)), parentDoc(p));
         for (int c = 0; c < CHILDREN_PER_PARENT; c++) {
           childrenWriter.updateDocument(new Term(CHILD_ID, childId(p, c)), childDoc(p, c));
@@ -274,10 +308,10 @@ public class TestAIJoinBenchmark extends LuceneTestCase {
   private IndexWriter newBenchWriter(Directory dir) throws IOException {
     return new IndexWriter(
         dir,
-        newIndexWriterConfig(new MockAnalyzer(random()))
+        new IndexWriterConfig()
             .setMergePolicy(NoMergePolicy.INSTANCE)
-            // pin the flush triggers: the randomized test config may pick tiny buffers
-            // and shatter the intended segment layout
+            // pin the flush triggers so the intended segment layout isn't shattered by tiny
+            // default buffers
             .setMaxBufferedDocs(IndexWriter.MAX_DOCS)
             .setRAMBufferSizeMB(256));
   }
