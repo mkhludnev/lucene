@@ -123,12 +123,13 @@ public final class AIJoinIndex implements Closeable {
   }
 
   /**
-   * Builds and persists the given missing pair columns, {@code {toSegmentOrd, fromSegmentOrd}}
-   * keyed by pair field name. Pairs concurrently built by another thread are awaited, not rebuilt.
-   * On return the internal searcher manager is refreshed past every requested pair.
+   * Builds and persists the given missing pair columns, keyed by pair field name to their
+   * (from-segment, to-segment) leaf ordinals. Pairs concurrently built by another thread are
+   * awaited, not rebuilt. On return the internal searcher manager is refreshed past every
+   * requested pair.
    */
   void buildPairs(
-      Map<String, int[]> missingPairs,
+      Map<String, AIJoinQuery.SegmentsTuple> missingPairs,
       IndexReader fromReader,
       String fromField,
       IndexReader toReader,
@@ -153,9 +154,9 @@ public final class AIJoinIndex implements Closeable {
         List<Column> columns = new ArrayList<>();
         int batchNumDocs = 0;
         for (String pairFieldName : owned.keySet()) {
-          int[] position = missingPairs.get(pairFieldName);
-          LeafReaderContext toContext = toReader.leaves().get(position[0]);
-          LeafReaderContext fromContext = fromReader.leaves().get(position[1]);
+          AIJoinQuery.SegmentsTuple position = missingPairs.get(pairFieldName);
+          LeafReaderContext toContext = toReader.leaves().get(position.toLeafOrd());
+          LeafReaderContext fromContext = fromReader.leaves().get(position.fromLeafOrd());
           long[] scratch =
               new long
                   [Math.toIntExact(
