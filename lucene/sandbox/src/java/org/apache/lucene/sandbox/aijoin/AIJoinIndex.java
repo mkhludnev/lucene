@@ -81,7 +81,8 @@ public final class AIJoinIndex implements Closeable {
    * One (from-segment, to-segment) pair's ordinal-map column: its field name and the name of the
    * sidecar segment carrying it, so the column survives join reader refreshes.
    */
-  record PairColumn(String pairFieldName, String joinSegmentName, int maxFromDoc, int [] toDocEdges) {}
+  record PairColumn(String pairFieldName, String joinSegmentName, int[] fromDocEdges, int [] toDocEdges,
+    int toCount) {}
 
   /** A pair's (from-segment, to-segment) leaf ordinals. */
   record SegmentsTuple(int fromLeafOrd, int toLeafOrd) {}

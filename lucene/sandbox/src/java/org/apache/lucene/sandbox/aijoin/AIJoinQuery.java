@@ -17,7 +17,6 @@
 package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -27,9 +26,6 @@ import java.util.function.Predicate;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.sandbox.aijoin.AIJoinIndex.PairColumn;
-import org.apache.lucene.sandbox.aijoin.AIJoinIndex.SegmentsTuple;
-import org.apache.lucene.sandbox.aijoin.AIJoinQuery.JoinSegment;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.FilteredDocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
@@ -143,7 +139,7 @@ class AIJoinQuery extends Query {
     }
 
     return new AIJoinWeight(
-        this, joinSearcher, existingJoinSegments, fromReader, searcher.getIndexReader(), scoreMode, boost);
+        this, joinSearcher, existingJoinSegments, searcher.getIndexReader(), scoreMode, boost);
   }
 
   /*** TODO move to util or index */

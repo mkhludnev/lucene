@@ -17,6 +17,7 @@
 package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -34,6 +35,7 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ParallelLeafReader;
 import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.DocIdSetIterator;
@@ -60,6 +62,8 @@ final class AIJoinUtil {
 
   private static final FieldType toDocsFieldType = new FieldType();
 
+  static final String TO_COUNT_PREFIX = "num_toDoc_";
+
   static {
     toDocsFieldType.setDocValuesType(DocValuesType.SORTED_NUMERIC);
     toDocsFieldType.freeze();
@@ -77,16 +81,104 @@ final class AIJoinUtil {
    */
   static List<Column> createJoinColumns(DocMapping mapping, String pairFieldName) {
     return List.of(
-        ordMapBatch(pairFieldName, mapping.toDocByFromDoc()),
+        ordMapBatch(pairFieldName, mapping),
         edgesColumn(FROM_EDGES_PREFIX + pairFieldName, mapping.fromDocEdges()),
-        edgesColumn(TO_EDGES_PREFIX + pairFieldName, mapping.toDocEdges()));
+        edgesColumn(TO_EDGES_PREFIX + pairFieldName, mapping.toDocEdges()),
+        edgesColumn(TO_COUNT_PREFIX + pairFieldName, new int[] {mapping.toCount()})
+      );
   }
 
   /**
    * Doc-id bounds and the from-doc-to-to-doc map produced by {@link #computeDocMapping}:
    * {@code fromDocEdges} and {@code toDocEdges} are each a pair's {min, max} doc bounds.
+   * {@link #toDocByFromDoc()} mirrors the on-disk column's read API, so freshly built pairs (not
+   * yet flushed to the join index) and pairs loaded from the join index can be walked by the same
+   * code.
    */
-  record DocMapping(int[] toDocByFromDoc, int[] fromDocEdges, int[] toDocEdges) {}
+  static final class DocMapping {
+    private final int[] toDocByFromDoc;
+    private final int[] fromDocEdges;
+    private final int[] toDocEdges;
+    private int toCount;
+
+    DocMapping(int[] toDocByFromDoc, int toCount, int[] fromDocEdges, int[] toDocEdges) {
+      this.toDocByFromDoc = toDocByFromDoc;
+      this.fromDocEdges = fromDocEdges;
+      this.toDocEdges = toDocEdges;
+      this.toCount = toCount;
+    }
+
+    /** Returns a fresh single-valued cursor over the from-doc -> to-doc map, positioned before doc 0. */
+    SortedNumericDocValues toDocByFromDoc() {
+      return new ArrayBackedSortedNumericDocValues(toDocByFromDoc);
+    }
+
+    int[] fromDocEdges() {
+      return fromDocEdges;
+    }
+
+    int[] toDocEdges() {
+      return toDocEdges;
+    }
+
+    int toCount() {
+      return toCount;
+    }
+  }
+
+  /**
+   * Adapts an int-array from-doc -> to-doc map (as produced by {@link #computeDocMapping}, {@code
+   * -1} meaning no value) to the {@link SortedNumericDocValues} read API, so it can be consumed
+   * the same way as the on-disk join column. Always single-valued until M:N pairs are supported.
+   */
+  private static final class ArrayBackedSortedNumericDocValues extends SortedNumericDocValues {
+    private final int[] toDocByFromDoc;
+    private int doc = -1;
+
+    ArrayBackedSortedNumericDocValues(int[] toDocByFromDoc) {
+      this.toDocByFromDoc = toDocByFromDoc;
+    }
+
+    @Override
+    public long nextValue() {
+      return toDocByFromDoc[doc];
+    }
+
+    @Override
+    public int docValueCount() {
+      return 1;
+    }
+
+    @Override
+    public boolean advanceExact(int target) {
+      doc = target;
+      return target < toDocByFromDoc.length && toDocByFromDoc[target] >= 0;
+    }
+
+    @Override
+    public int docID() {
+      return doc;
+    }
+
+    @Override
+    public int nextDoc() {
+      return advance(doc + 1);
+    }
+
+    @Override
+    public int advance(int target) {
+      while (target < toDocByFromDoc.length && toDocByFromDoc[target] < 0) {
+        target++;
+      }
+      doc = target < toDocByFromDoc.length ? target : NO_MORE_DOCS;
+      return doc;
+    }
+
+    @Override
+    public long cost() {
+      return toDocByFromDoc.length;
+    }
+  }
 
   /**
    * Merges the sorted term dictionaries of one (from-segment, to-segment) pair and resolves every
@@ -151,6 +243,7 @@ final class AIJoinUtil {
     int maxFromDoc = -1;
     int minToDoc = DocIdSetIterator.NO_MORE_DOCS;
     int maxToDoc = -1;
+    int toCount = 0;
     for (int fromDoc = fromDV.nextDoc();
         fromDoc != DocIdSetIterator.NO_MORE_DOCS;
         fromDoc = fromDV.nextDoc()) {
@@ -169,6 +262,7 @@ final class AIJoinUtil {
         maxFromDoc = Math.max(maxFromDoc, fromDoc);
         minToDoc = Math.min(minToDoc, toDoc);
         maxToDoc = Math.max(maxToDoc, toDoc);
+        toCount++;
       }
     }
     if (maxFromDoc < 0) {
@@ -183,6 +277,7 @@ final class AIJoinUtil {
     }
     return new DocMapping(
         toDocByFromDoc,
+        toCount,
         new int[] {minFromDoc, maxFromDoc},
         new int[] {minToDoc, maxToDoc});
   }
@@ -228,28 +323,30 @@ final class AIJoinUtil {
    * SORTED_NUMERIC docvalue is the matching to-side doc id. From docs without a match keep -1 in
    * the array and get no value, hence the column is sparse.
    */
-  static Column ordMapBatch(String fieldName, int[] toDocByFromDoc) {
-
+  static Column ordMapBatch(String fieldName, DocMapping mapping) {
     Column column =
         new LongColumn(TO_DOC_VAL_BY_FROM_DOCNUM+fieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
           @Override
           public LongTupleCursor tuples() {
+            // a fresh cursor each call, per the Column contract, wrapping a fresh DV instance too
+            SortedNumericDocValues values = mapping.toDocByFromDoc();
             return new LongTupleCursor() {
-              private int fromDoc = -1;
-
               @Override
               public int nextDoc() {
-                while (++fromDoc < toDocByFromDoc.length) {
-                  if (toDocByFromDoc[fromDoc] >= 0) {
-                    return fromDoc;
-                  }
+                try {
+                  return values.nextDoc();
+                } catch (IOException e) {
+                  throw new UncheckedIOException(e);
                 }
-                return DocIdSetIterator.NO_MORE_DOCS;
               }
 
               @Override
               public long longValue() {
-                return toDocByFromDoc[fromDoc];
+                try {
+                  return values.nextValue();
+                } catch (IOException e) {
+                  throw new UncheckedIOException(e);
+                }
               }
             };
           }

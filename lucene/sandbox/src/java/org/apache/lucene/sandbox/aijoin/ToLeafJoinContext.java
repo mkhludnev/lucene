@@ -5,11 +5,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Set;
 
 import org.apache.lucene.util.BitSetIterator;
@@ -40,14 +38,14 @@ import org.apache.lucene.search.Weight;
  * TODO prune by "to" range if it's under slice searching
  * TODO pass raw cacheless searcher
 */
-class ToSegmentJoinContext {
+class ToLeafJoinContext {
   final LeafReaderContext toContext;
   final Query fromQuery;
   final IndexSearcher cachedFromSearcher;
   private final DocIdSetIterator[] fromScorersBySegOrd;
-  private final Map<String, JoinSegment> existingJoinSegments;
-  private final IndexSearcher weiaghtAgeJoinSearcher;
-  private final IndexSearcher joinSearcher;
+  private final Map<String, JoinSegment> weightAgeJoinSegments;
+  private final IndexSearcher weightAgeJoinSearcher;
+  private final IndexSearcher scorerSupplierAgeJoinSearcher;
   final String fromField;
   final String toField;
   final Map<String, SegmentsTuple> requiredJoinFields;
@@ -61,19 +59,26 @@ class ToSegmentJoinContext {
   private Map<String, DocMapping> newJoinSegments = null;
   private final PairColumn[] loadedJoinSegments;// = new PairColumn[this.cachedFromSearcher.getLeafContexts().size()];
 
-  ToSegmentJoinContext( LeafReaderContext toContext, String fromField,
+  /**
+   *
+   * @param weightAgeJoinSegments the join segments cached at {@link AIJoinQuery#createWeight} time
+   * @param weightAgeJoinSearcher the join searcher cached at {@link AIJoinQuery#createWeight} time
+   * @param scorerSupplierAgeJoinSearcher the join searcher used at {@link AIJoinWeight#scorerSupplier} time
+   */
+
+  ToLeafJoinContext( LeafReaderContext toContext, String fromField,
      Query fromQuery, IndexSearcher cachedFromSearcher, String toField,
-      IndexReader toReader, Map<String, JoinSegment> existingJoinSegments,
-       IndexSearcher maybeStaleJoinSearcher, IndexSearcher joinSearcher,
+      IndexReader toReader, Map<String, JoinSegment> weightAgeJoinSegments,
+       IndexSearcher weightAgeJoinSearcher, IndexSearcher scorerSupplierAgeJoinSearcher,
        AIJoinIndex joinIndex) throws IOException {
     this.toContext = toContext;
     this.fromField = fromField;
     this.fromQuery = fromQuery;
     this.cachedFromSearcher = cachedFromSearcher;
     this.toField = toField;
-    this.existingJoinSegments = existingJoinSegments;
-    this.weiaghtAgeJoinSearcher = maybeStaleJoinSearcher;
-    this.joinSearcher = joinSearcher;
+    this.weightAgeJoinSegments = weightAgeJoinSegments;
+    this.weightAgeJoinSearcher = weightAgeJoinSearcher;
+    this.scorerSupplierAgeJoinSearcher = scorerSupplierAgeJoinSearcher;
     this.joinIndex = joinIndex;
     this.loadedJoinSegments = new PairColumn[this.cachedFromSearcher.getLeafContexts().size()];
 
@@ -193,9 +198,9 @@ class ToSegmentJoinContext {
     // (and, after a drastic change, its segment names) no longer necessarily resolve against
     // the freshly acquired joinSearcher, so it must be recovered first
     Map<String, JoinSegment> currentJoinSegments =
-        this.weiaghtAgeJoinSearcher == joinSearcher
-            ? existingJoinSegments
-            : ToSegmentJoinContext.recoverExistingJoinSegments(joinSearcher,  existingJoinSegments, this.requiredJoinFields.keySet());
+        this.weightAgeJoinSearcher == scorerSupplierAgeJoinSearcher
+            ? weightAgeJoinSegments
+            : ToLeafJoinContext.recoverExistingJoinSegments(scorerSupplierAgeJoinSearcher,  weightAgeJoinSegments, this.requiredJoinFields.keySet());
     for (Iterator<Map.Entry<String, SegmentsTuple>> requestedJoinFieldEntriesIter = this.requiredJoinFields.entrySet().iterator();
         requestedJoinFieldEntriesIter.hasNext(); ) {
       Map.Entry<String, SegmentsTuple> entry = requestedJoinFieldEntriesIter.next();
@@ -205,10 +210,10 @@ class ToSegmentJoinContext {
       JoinSegment joinSegment = currentJoinSegments.get(pairFieldName);
       if (joinSegment != null) {
         notFound.remove(pairFieldName);
-        LeafReaderContext joinFeafSeg = joinSearcher.getLeafContexts().get(joinSegment.joinSegmentLeafOrd()); // validate the join segment is still present
+        LeafReaderContext joinFeafSeg = scorerSupplierAgeJoinSearcher.getLeafContexts().get(joinSegment.joinSegmentLeafOrd()); // validate the join segment is still present
         assert AIJoinUtil.segmentName(joinFeafSeg).equals(joinSegment.joinSegmentName());
 
-        int[] fromDocEdges = ToSegmentJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.FROM_EDGES_PREFIX + pairFieldName);
+        int[] fromDocEdges = ToLeafJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.FROM_EDGES_PREFIX + pairFieldName);
         int minFromDoc = fromDocEdges[0];
         int maxFromDoc = fromDocEdges[1];
         // check if from matche hits this join segment
@@ -243,8 +248,11 @@ class ToSegmentJoinContext {
             new PairColumn(
                 pairFieldName,
                 joinSegment.joinSegmentName(),
-                maxFromDoc,// i need to score upto
-                ToSegmentJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.TO_EDGES_PREFIX + pairFieldName));
+                fromDocEdges,
+                ToLeafJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.TO_EDGES_PREFIX + pairFieldName),
+                // TODO use it for ordefing join segment iteration, desc
+                ToLeafJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.TO_COUNT_PREFIX + pairFieldName)[0]
+              );
       }
     }
     return notFound;
@@ -310,7 +318,7 @@ class ToSegmentJoinContext {
 
   /**
    * TODO move to util or index
-   * Recovers {@link #existingJoinSegments}, cached against {@link #weiaghtAgeJoinSearcher}, into
+   * Recovers {@link #weightAgeJoinSegments}, cached against {@link #weightAgeJoinSearcher}, into
    * the freshly acquired {@code joinSearcher}. The join index is append-only under {@link
    * org.apache.lucene.index.NoMergePolicy}, so a seen segment normally still sits at the same
    * leaf ordinal; that's checked first since it's a plain array lookup. A segment reordered since
@@ -357,7 +365,7 @@ class ToSegmentJoinContext {
     return recovered;
   }
 
-  /** Reads a pair's persisted {min, max} doc edges, both stored on doc 0 of the column.
+  /** Reads a pair's persisted values, all stored on doc 0 of the column.
    * TODO move it somewhere
   */
   static int[] loadEdges(LeafReaderContext joinContext, String edgesFieldName)
@@ -368,11 +376,11 @@ class ToSegmentJoinContext {
     int zeroDoc = edgesDV.nextDoc();
     assert zeroDoc == 0
         : "expected edges column to be fully materialized, but got doc " + zeroDoc;
-    assert edgesDV.docValueCount() == 2
-        : "expected edges column to be fully materialized, but got "
-            + edgesDV.docValueCount()
-            + " values";
-    return new int[] {(int) edgesDV.nextValue(), (int) edgesDV.nextValue()};
+    int[] values = new int[edgesDV.docValueCount()];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = (int) edgesDV.nextValue();
+    }
+    return values;
   }
 
   public ScorerSupplier scorerSupplier(ScoreMode scoreMode, float boost) {
@@ -400,6 +408,15 @@ class ToSegmentJoinContext {
                   // absolute positions, so the approximation stops visiting
                   // non-matching docs
                   shift = approximation.docID();
+                  // TODO the this is: it's enough to just confirm the match the return the control.
+                  // TODO there, should be a refined bitset
+                  // TODO when we need to refine an approx, we go throug join segments,
+                  // TODO and drop them into refined bitset until we confirm the match
+                  // TODO the order of iteration is: to side doc freq, which we neeed to persist and read then
+                  // TODO once we drop a join segment to refined bitset we exclude it from iterations
+                  // TODO also, just boundary check the following matches checks
+                  // TODO the following matches() checks, at first confirm with refied bitset,
+                  // TODO if it's false procede with to bitset dumping into refined bitset
                   matchedToDocs = refineToMatches( shift);
                   toApproximation.clear(shift, lastToDoc + 1);
                   FixedBitSet.orRange(matchedToDocs, 0, toApproximation, shift, lastToDoc - shift + 1);
@@ -427,15 +444,17 @@ class ToSegmentJoinContext {
     };
   }
 
+  /**
+  */
   private FixedBitSet refineToMatches(int shift)
       throws IOException {
     FixedBitSet matchedToDocs = new FixedBitSet(lastToDoc - shift + 1);
     IndexSearcher freshSearcher = this.joinIndex.acquire();
     try {
 
-      Map<String, JoinSegment> currentJoinSegments = freshSearcher == this.joinSearcher
-          ? existingJoinSegments
-          : ToSegmentJoinContext.recoverExistingJoinSegments(freshSearcher, existingJoinSegments, this.requiredJoinFields.keySet());
+      Map<String, JoinSegment> currentJoinSegments = freshSearcher == this.scorerSupplierAgeJoinSearcher
+          ? weightAgeJoinSegments
+          : ToLeafJoinContext.recoverExistingJoinSegments(freshSearcher, weightAgeJoinSegments, this.requiredJoinFields.keySet());
 
       // currentJoinSegments is not scoped to this to-leaf's required fields: it may hold pairs
       // for other to-segments too (superset), and it may still be missing a pair that this
@@ -468,7 +487,7 @@ class ToSegmentJoinContext {
           DocIdSetIterator matchedFromDocs = this.fromScorersBySegOrd[this.requiredJoinFields.get(fieldName).fromLeafOrd()];
           assert matchedFromDocs != null : "from segment has no cached matches: " + this.requiredJoinFields.get(fieldName).fromLeafOrd();
           for (int fromDoc = matchedFromDocs.docID(); // prepositioned to the first match
-              fromDoc != DocIdSetIterator.NO_MORE_DOCS && fromDoc <= joinSegmentEdges.maxFromDoc(); fromDoc = matchedFromDocs.nextDoc()) {
+              fromDoc != DocIdSetIterator.NO_MORE_DOCS && fromDoc <= joinSegmentEdges.fromDocEdges()[1]; fromDoc = matchedFromDocs.nextDoc()) {
 
             if (toDocsByFromDoc.advanceExact(fromDoc)) {
               for (int i = 0; i < toDocsByFromDoc.docValueCount(); i++) {
@@ -488,20 +507,23 @@ class ToSegmentJoinContext {
           continue;
         } else if (newJoinSegments != null && newJoinSegments.containsKey(fieldName)) {
           DocMapping docMapping = newJoinSegments.get(fieldName); // TODO extract/abstract
+          SortedNumericDocValues toDocsByFromDoc = docMapping.toDocByFromDoc();
 
           DocIdSetIterator matchedFromDocs = this.fromScorersBySegOrd[this.requiredJoinFields.get(fieldName).fromLeafOrd()];
           assert matchedFromDocs != null : "from segment has no cached matches: " + this.requiredJoinFields.get(fieldName).fromLeafOrd();
           for (int fromDoc = matchedFromDocs.docID(); // prepositioned to the first match
               fromDoc != DocIdSetIterator.NO_MORE_DOCS && fromDoc <= docMapping.fromDocEdges()[1]; fromDoc = matchedFromDocs.nextDoc()) {
-            int toDocMatch;
-            if ((toDocMatch = docMapping.toDocByFromDoc()[fromDoc]) >= 0) {
-              assert toDocMatch <= docMapping.toDocEdges()[1] && toDocMatch >= docMapping.toDocEdges()[0] : "to doc " + toDocMatch + " above edges union max " + Arrays.toString(docMapping.toDocEdges());
-              // shift is wherever the approximation iterator first landed, which need not be
-              // the global firstToDoc (e.g. under a boolean conjunction); a match below shift
-              // is unreachable -- the iterator only moves forward -- so it's dropped rather
-              // than written at a negative offset
-              if (toDocMatch >= shift) {
-                matchedToDocs.set(toDocMatch - shift);
+            if (toDocsByFromDoc.advanceExact(fromDoc)) {
+              for (int i = 0; i < toDocsByFromDoc.docValueCount(); i++) {
+                int toDocMatch = (int) toDocsByFromDoc.nextValue();
+                assert toDocMatch <= docMapping.toDocEdges()[1] && toDocMatch >= docMapping.toDocEdges()[0] : "to doc " + toDocMatch + " above edges union max " + Arrays.toString(docMapping.toDocEdges());
+                // shift is wherever the approximation iterator first landed, which need not be
+                // the global firstToDoc (e.g. under a boolean conjunction); a match below shift
+                // is unreachable -- the iterator only moves forward -- so it's dropped rather
+                // than written at a negative offset
+                if (toDocMatch >= shift) {
+                  matchedToDocs.set(toDocMatch - shift);
+                }
               }
             }
           }
