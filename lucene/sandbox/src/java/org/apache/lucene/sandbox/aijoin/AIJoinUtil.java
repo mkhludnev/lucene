@@ -32,6 +32,7 @@ import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.ParallelLeafReader;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
@@ -170,6 +171,16 @@ final class AIJoinUtil {
         maxToDoc = Math.max(maxToDoc, toDoc);
       }
     }
+    if (maxFromDoc < 0) {
+      // no from doc in this pair maps to any to doc: normalize both edges to the symmetric
+      // {-1, -1} sentinel. An asymmetric one (e.g. {NO_MORE_DOCS, -1}) doesn't round-trip
+      // through the join index's SORTED_NUMERIC edges column, which always returns its two
+      // values in ascending numeric order regardless of which was written as "min" -- so
+      // {NO_MORE_DOCS, -1} silently comes back as {-1, NO_MORE_DOCS} on the next read.
+      minFromDoc = -1;
+      minToDoc = -1;
+      maxToDoc = -1;
+    }
     return new DocMapping(
         toDocByFromDoc,
         new int[] {minFromDoc, maxFromDoc},
@@ -271,7 +282,11 @@ final class AIJoinUtil {
    * Peels wrappers off a leaf reader down to its {@link SegmentReader}. {@link
    * FilterLeafReader#unwrap} alone is not enough: wrappers like {@code
    * SoftDeletesDirectoryReaderWrapper} produce {@link FilterCodecReader} leaves, which are not
-   * {@link FilterLeafReader}s, and the two kinds may alternate.
+   * {@link FilterLeafReader}s, and the two kinds may alternate. Tests additionally wrap readers in
+   * a {@link ParallelLeafReader} (e.g. {@code LuceneTestCase#newSearcher}); that class can in
+   * general combine several independent readers side by side, but when it wraps exactly one (the
+   * common case, including every reader the test framework wraps purely for coverage) that one is
+   * unambiguous and safe to descend into.
    */
   static SegmentReader segmentReader(LeafReader reader) {
     while (true) {
@@ -281,6 +296,15 @@ final class AIJoinUtil {
         reader = filterLeafReader.getDelegate();
       } else if (reader instanceof FilterCodecReader filterCodecReader) {
         reader = filterCodecReader.getDelegate();
+      } else if (reader instanceof ParallelLeafReader parallelLeafReader) {
+        LeafReader[] parallelReaders = parallelLeafReader.getParallelReaders();
+        if (parallelReaders.length != 1) {
+          throw new IllegalArgumentException(
+              "cannot unwrap a SegmentReader from a ParallelLeafReader combining "
+                  + parallelReaders.length
+                  + " independent readers");
+        }
+        reader = parallelReaders[0];
       } else {
         throw new IllegalArgumentException(
             "cannot unwrap a SegmentReader from " + reader.getClass().getName());
