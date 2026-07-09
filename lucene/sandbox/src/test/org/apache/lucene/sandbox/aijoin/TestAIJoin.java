@@ -16,6 +16,7 @@
  */
 package org.apache.lucene.sandbox.aijoin;
 
+import com.carrotsearch.randomizedtesting.annotations.Seed;
 import com.carrotsearch.randomizedtesting.generators.RandomPicks;
 import java.io.Closeable;
 import java.io.IOException;

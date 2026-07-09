@@ -19,31 +19,30 @@ package org.apache.lucene.sandbox.aijoin;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
+import java.util.function.IntFunction;
+import java.util.function.Predicate;
+
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.index.SortedNumericDocValues;
-import org.apache.lucene.search.ConstantScoreScorer;
+import org.apache.lucene.sandbox.aijoin.AIJoinIndex.PairColumn;
+import org.apache.lucene.sandbox.aijoin.AIJoinIndex.SegmentsTuple;
+import org.apache.lucene.sandbox.aijoin.AIJoinQuery.JoinSegment;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.FilteredDocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.LRUQueryCache;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.QueryCachingPolicy;
 import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
-import org.apache.lucene.search.TwoPhaseIterator;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.util.BitSet;
-import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.FixedBitSet;
 
 /**
  * Joins the from-side index to the to-side index this query is executed against, resolving
@@ -56,333 +55,14 @@ import org.apache.lucene.util.FixedBitSet;
  */
 class AIJoinQuery extends Query {
 
-  private final class AIJoinWeight extends Weight {
-    private final BitSet[] fromMatches;
-    private final IndexReader fromReader;
-    private final ScoreMode scoreMode;
-    private final float boost;
-    private final IndexReader toReader;
-
-    /**
-     * [toSegmentOrd][fromSegmentOrd] -> the pair column resolved at construction time; null where
-     * the from segment has no cached matches, the pair maps no from-side values, or no cached match
-     * falls into the pair's from-doc range. Pair columns record the sidecar segment name, not a
-     * leaf context, so they stay valid across join reader refreshes.
-     */
-    //private final PairColumn[][] pairColumnsByTo;
-
-    private AIJoinWeight(
-        Query query,
-        BitSet[] fromMatches,
-        IndexReader fromReader,
-        IndexReader toReader,
-        ScoreMode scoreMode,
-        float boost)
-        throws IOException {
-      super(query);
-      this.fromMatches = fromMatches;
-      this.fromReader = fromReader;
-      this.scoreMode = scoreMode;
-      this.boost = boost;
-      this.toReader = toReader;
-    }
-
-    /**
-     * Sweeps the join index leaves once within a single acquire/release bracket, resolving the
-     * requested {@code pairFieldName -> SegmentsTuple} positions into {@link PairColumn}s recorded
-     * by sidecar segment name. Returns an array indexed by from-segment ordinal, holding the
-     * resolved {@link PairColumn} only for a pair that is both persisted and contributing (its
-     * from-doc range holds a cached match); a pair that is unpersisted, or persisted but
-     * non-contributing, leaves its slot null. Every pair name found persisted, whether or not it
-     * contributes, is added to {@code persistedNames}: the caller must consult that set, not
-     * array nullness, to tell an unbuilt pair apart from a persisted-but-non-contributing one, so
-     * a persisted-but-non-contributing pair is never rebuilt.
-     */
-    private PairColumn[] resolvePairColumns(
-        Map<String, SegmentsTuple> pairPositions, Set<String> persistedNames)
-        throws IOException {
-      PairColumn[] persisted = new PairColumn[fromReader.leaves().size()];
-      IndexSearcher joinSearcher = joinIndex.acquire();
-      try {
-        for (LeafReaderContext joinContext : joinSearcher.getIndexReader().leaves()) {
-          String segmentName = AIJoinIndex.segmentName(joinContext);
-          for (FieldInfo fieldInfo : joinContext.reader().getFieldInfos()) {
-            // key off the always-written edges column: the doc-map column itself may be empty
-            // when the pair maps no from-side values
-            String name = fieldInfo.name;
-            if (!name.endsWith(AIJoinUtil.FROM_EDGES_SUFFIX)) {
-              continue;
-            }
-            String pairFieldName =
-                name.substring(0, name.length() - AIJoinUtil.FROM_EDGES_SUFFIX.length());
-            SegmentsTuple position = pairPositions.get(pairFieldName);
-            if (position == null) {
-              continue;
-            }
-            persistedNames.add(pairFieldName);
-            int fromContextOrd = position.fromLeafOrd();
-
-            BitSet fromBits = fromMatches[fromContextOrd];
-            int[] fromDocEdges = loadEdges(joinContext, name);
-            int minFromDoc = fromDocEdges[0];
-            int maxFromDoc = fromDocEdges[1];
-            // a pair with no mapped from docs persists sentinel edges that sort to
-            // {-1, Integer.MAX_VALUE}; the bounds guard rejects it before nextSetBit
-            int firstMatch =
-                minFromDoc >= 0 && minFromDoc < fromBits.length()
-                    ? fromBits.nextSetBit(minFromDoc)
-                    : DocIdSetIterator.NO_MORE_DOCS;
-            if (firstMatch != DocIdSetIterator.NO_MORE_DOCS && firstMatch <= maxFromDoc) {
-              int[] toDocEdges = loadEdges(joinContext, pairFieldName + AIJoinUtil.TO_EDGES_SUFFIX);
-              //pairColumnsByTo[position.toLeafOrd()]
-              persisted[fromContextOrd] =
-                  new PairColumn(pairFieldName, segmentName, toDocEdges[0], toDocEdges[1]);
-            }
-            // otherwise no cached from-side match falls into the from-doc range this pair
-            // maps, so the pair cannot contribute and its slot stays null
-          }
-        }
-      } finally {
-        joinIndex.release(joinSearcher);
-      }
-      return persisted;
-    }
-
-    /** Reads a pair's persisted {min, max} doc edges, both stored on doc 0 of the column. */
-    private static int[] loadEdges(LeafReaderContext joinContext, String edgesFieldName)
-        throws IOException {
-      SortedNumericDocValues edgesDV =
-          joinContext.reader().getSortedNumericDocValues(edgesFieldName);
-      assert edgesDV != null : "expected edges column to be present: " + edgesFieldName;
-      int zeroDoc = edgesDV.nextDoc();
-      assert zeroDoc == 0
-          : "expected edges column to be fully materialized, but got doc " + zeroDoc;
-      assert edgesDV.docValueCount() == 2
-          : "expected edges column to be fully materialized, but got "
-              + edgesDV.docValueCount()
-              + " values";
-      return new int[] {(int) edgesDV.nextValue(), (int) edgesDV.nextValue()};
-    }
-
-    @Override
-    public Explanation explain(LeafReaderContext context, int doc) throws IOException {
-      ScorerSupplier supplier = scorerSupplier(context);
-      if (supplier != null) {
-        Scorer scorer = supplier.get(1);
-        if (scorer.iterator().advance(doc) == doc) {
-          return Explanation.match(scorer.score(), AIJoinQuery.this.toString());
-        }
-      }
-      return Explanation.noMatch(AIJoinQuery.this.toString());
-    }
-
-    @Override
-    public int count(LeafReaderContext context) throws IOException {
-      // cost() is a range-size upper bound, not an exact match count, so counting has to
-      // fall back to actually driving the two-phase iterator
-      return super.count(context);
-    }
-
-    @Override
-    public ScorerSupplier scorerSupplier(LeafReaderContext tolrc) throws IOException {
-
-      //PairColumn[] pairColumns = new PairColumn[fromReader.leaves().size()]; //pairColumnsByTo[tolrc.ord];
-
-            // name every contributing (from, to) pair column; pair field names are unique across pairs
-      Map<String, SegmentsTuple> pairPositions = new HashMap<>();
-      for (LeafReaderContext fromContext : fromReader.leaves()) {
-        // no cached from-side matches means this from segment cannot contribute
-        if (fromMatches[fromContext.ord] == null) {
-          continue; // pass every ton instead TODO
-        }
-        for (LeafReaderContext toContext : List.of(tolrc)) {
-          String pairFieldName =
-              AIJoinUtil.pairFieldName(fromContext, fromField, toContext, toField);
-          pairPositions.put(pairFieldName, new SegmentsTuple(fromContext.ord, toContext.ord));
-        }
-      }
-      // resolve the pairs already persisted; build the missing ones on demand and resolve them
-      // from the refreshed join reader. A pair, once built, always persists at least its edges
-      // columns, so missing pairs are built at most once
-      Set<String> persistedNames = new HashSet<>();
-      PairColumn[] persisted = resolvePairColumns(pairPositions, persistedNames);
-      Map<String, SegmentsTuple> missingPairs = new HashMap<>(pairPositions);
-      missingPairs.keySet().removeAll(persistedNames);
-      if (!missingPairs.isEmpty()) {
-        joinIndex.buildPairs(missingPairs, fromReader, fromField, toReader, toField);
-        Set<String> builtNames = new HashSet<>();
-        PairColumn[] built = resolvePairColumns(missingPairs, builtNames);
-        assert builtNames.containsAll(missingPairs.keySet())
-            : "pairs still missing after build: " + missingPairs.keySet();
-        // put just-built contributing columns into the earlier-seen array; a built pair that
-        // still doesn't contribute leaves its slot null, same as an already-persisted one
-        for (SegmentsTuple position : missingPairs.values()) {
-          if (built[position.fromLeafOrd()] != null) {
-            persisted[position.fromLeafOrd()] = built[position.fromLeafOrd()];
-          }
-        }
-      }
-
-
-      // first pass: union the contributing pairs' to-doc ranges; every possible match in this
-      // to segment falls into [minToDoc, maxToDoc]
-      int minToDoc = DocIdSetIterator.NO_MORE_DOCS;
-      int maxToDoc = -1;
-      long matchedFromDocsCount = 0;
-      FixedBitSet rangeBits = new FixedBitSet(tolrc.reader().maxDoc() //+ 1//why???
-                                            );
-      for (int fromOrd = 0; fromOrd < persisted.length; fromOrd++) {
-        if (persisted[fromOrd] != null) { // here we can shuffle them, and check whether we have from match on this segement only here
-          minToDoc = Math.min(minToDoc, persisted[fromOrd].minToDoc());
-          maxToDoc = Math.max(maxToDoc, persisted[fromOrd].maxToDoc());
-          matchedFromDocsCount += fromMatches[fromOrd].approximateCardinality();
-          rangeBits.set(persisted[fromOrd].minToDoc(), persisted[fromOrd].maxToDoc() + 1);
-        }
-      }
-      if (maxToDoc < 0) {
-        // no from segment contributes to this to segment
-        return null;
-      }
-      final int firstToDoc = minToDoc;
-      final int lastToDoc = maxToDoc;
-      // the first matches() call sweeps every matched from doc to materialize the mapping;
-      // later calls are a bitset lookup
-      final float matchCost = matchedFromDocsCount;
-      return new ScorerSupplier() {
-        @Override
-        public Scorer get(long leadCost) throws IOException {
-          DocIdSetIterator approximation =
-              new BitSetIterator(rangeBits, rangeBits.approximateCardinality()//lastToDoc - firstToDoc + 1
-
-              );
-          TwoPhaseIterator twoPhase =
-              new TwoPhaseIterator(approximation) {
-                boolean pruned = false;
-
-                @Override
-                public boolean matches() throws IOException {
-                  if (!pruned) {
-                    FixedBitSet matchedToDocs;
-                    int shift;
-                    // prune the approximation to the resolved matches: drop the
-                    // remaining range bits and or the matches back in at their
-                    // absolute positions, so the approximation stops visiting
-                    // non-matching docs
-                    shift = approximation.docID();
-                    matchedToDocs = resolveMatchedToDocs(persisted, shift, lastToDoc);
-                    rangeBits.clear(shift, lastToDoc + 1);
-                    FixedBitSet.orRange(matchedToDocs, 0, rangeBits, shift, lastToDoc - shift + 1);
-                    pruned = true;
-                    return rangeBits.get(approximation.docID());
-                  }
-                  // the bitset spans [shift, lastToDoc] shifted to zero
-                  // return matchedToDocs.get(approximation.docID() - shift);
-                  assert /*return*/ rangeBits.get(approximation.docID()); // always true ??
-                  return true;
-                }
-
-                @Override
-                public float matchCost() {
-                  return matchCost;
-                }
-              };
-          return new ConstantScoreScorer(boost, scoreMode, twoPhase);
-        }
-
-        @Override
-        public long cost() {
-          return lastToDoc - firstToDoc + 1;
-        }
-      };
-    }
-
-    /**
-     * Second phase of the join: unions the to-side doc ids mapped from every matched from doc. The
-     * returned bitset spans only [minToDoc, maxToDoc], with minToDoc shifted to bit 0; matches
-     * mapped below minToDoc are dropped, so the caller must never look them up.
-     *
-     * <p>All join index reads happen within one acquire/release bracket: the join reader may have
-     * been refreshed since weight creation, so each pair column is re-resolved by sidecar segment
-     * name in the freshly acquired reader.
-     */
-    private FixedBitSet resolveMatchedToDocs(PairColumn[] pairColumns, int minToDoc, int maxToDoc)
-        throws IOException {
-      FixedBitSet matchedToDocs = new FixedBitSet(maxToDoc - minToDoc + 1);
-      IndexSearcher joinSearcher = joinIndex.acquire();
-      try {
-        Map<String, LeafReaderContext> joinLeavesBySegment = new HashMap<>();
-        for (LeafReaderContext joinContext : joinSearcher.getIndexReader().leaves()) {
-          joinLeavesBySegment.put(AIJoinIndex.segmentName(joinContext), joinContext);
-        }
-        for (int fromOrd = 0; fromOrd < pairColumns.length; fromOrd++) {
-          PairColumn pairColumn = pairColumns[fromOrd];
-          if (pairColumn == null) {
-            // this from segment cannot contribute to this to segment
-            continue;
-          }
-          LeafReaderContext joinContext = joinLeavesBySegment.get(pairColumn.joinSegmentName());
-          if (joinContext == null) {
-            // the join index is append-only: a resolved pair references live side
-            // segments, whose sidecar segments reaping must never drop
-            throw new IllegalStateException(
-                "join index segment ["
-                    + pairColumn.joinSegmentName()
-                    + "] carrying pair ["
-                    + pairColumn.pairFieldName()
-                    + "] disappeared");
-          }
-          BitSet matches = fromMatches[fromOrd];
-          SortedNumericDocValues toDocsByFromDoc =
-              joinContext.reader().getSortedNumericDocValues(pairColumn.pairFieldName());
-          BitSetIterator matchedFromDocs =
-              new BitSetIterator(matches, matches.approximateCardinality());
-          for (int fromDoc = matchedFromDocs.nextDoc();
-              fromDoc != DocIdSetIterator.NO_MORE_DOCS;
-              fromDoc = matchedFromDocs.nextDoc()) {
-
-            if (toDocsByFromDoc.advanceExact(fromDoc)) {
-              for (int i = 0; i < toDocsByFromDoc.docValueCount(); i++) {
-                int toDocMatch = (int) toDocsByFromDoc.nextValue();
-                if (toDocMatch >= minToDoc) {
-                  // matches below minToDoc (including the -1 no-match marker) are
-                  // unreachable and dropped
-                  assert toDocMatch <= maxToDoc
-                      : "to doc " + toDocMatch + " above edges union max " + maxToDoc;
-                  matchedToDocs.set(toDocMatch - minToDoc);
-                }
-              }
-            }
-          }
-        }
-      } finally {
-        joinIndex.release(joinSearcher);
-      }
-      return matchedToDocs;
-    }
-
-    @Override
-    public boolean isCacheable(LeafReaderContext lrc) {
-      // matches depend on the from-side searcher and the external join index, which the
-      // query cache cannot see
-      return false;
-    }
-  }
-
-  /**
-   * One (from-segment, to-segment) pair's ordinal-map column: its field name and the name of the
-   * sidecar segment carrying it, so the column survives join reader refreshes.
-   */
-  private record PairColumn(
-      String pairFieldName, String joinSegmentName, int minToDoc, int maxToDoc) {}
-
-  /** A pair's (from-segment, to-segment) leaf ordinals. */
-  record SegmentsTuple(int fromLeafOrd, int toLeafOrd) {}
-
-  private final AIJoinIndex joinIndex;
-  private final String fromField;
-  private final Query fromQuery;
+  final AIJoinIndex joinIndex;
+  final String fromField;
+  final Query fromQuery;
   private final IndexSearcher fromSearcher;
-  private final String toField;
+  final String toField;
+  IndexSearcher cachedFromSearcher;
+
+  record JoinSegment(String pairFieldName, String joinSegmentName, int joinSegmentLeafOrd) {}
 
   AIJoinQuery(
       AIJoinIndex joinIndex,
@@ -395,6 +75,18 @@ class AIJoinQuery extends Query {
     this.fromQuery = Objects.requireNonNull(fromQuery, "fromQuery");
     this.fromSearcher = Objects.requireNonNull(fromSearcher, "fromSearcher");
     this.toField = Objects.requireNonNull(toField, "toField");
+    // presumabily keep it in AIJoinIndex
+    this.cachedFromSearcher = new IndexSearcher(fromSearcher.getIndexReader());
+    this.cachedFromSearcher.setQueryCache(new LRUQueryCache(fromSearcher.getLeafContexts().size()+1,
+     fromSearcher.getIndexReader().maxDoc()/8 *2));
+    this.cachedFromSearcher.setQueryCachingPolicy(new QueryCachingPolicy() {
+      @Override
+      public boolean shouldCache(Query query) {
+        return true;
+      }
+      @Override
+      public void onUse(Query query) {}
+    });
   }
 
   @Override
@@ -415,7 +107,7 @@ class AIJoinQuery extends Query {
     // segment; from segments without matches keep null
     IndexReader fromReader = fromSearcher.getIndexReader();
     Weight fromWeight = fromSearcher.createWeight(fromQuery, ScoreMode.COMPLETE_NO_SCORES, 1f);
-    BitSet[] fromMatches = new BitSet[fromReader.leaves().size()];
+    BitSet[] fromMatchesByOrd = new BitSet[fromReader.leaves().size()];
     for (LeafReaderContext fromContext : fromReader.leaves()) {
       ScorerSupplier supplier = fromWeight.scorerSupplier(fromContext);
       if (supplier != null) {
@@ -433,11 +125,42 @@ class AIJoinQuery extends Query {
                 }
               };
         }
-        fromMatches[fromContext.ord] = BitSet.of(iterator, fromContext.reader().maxDoc());
+        fromMatchesByOrd[fromContext.ord] = BitSet.of(iterator, fromContext.reader().maxDoc());
       }
     }
+    // from segments without cached matches resolve to null rather than an out-of-range index
+    IntFunction<BitSet> fromMatches = ord -> fromMatchesByOrd[ord];
+
+    // check exising join segemtent this hash will be across all to-segments scorers
+    Map<String,JoinSegment> existingJoinSegments;
+    IndexSearcher joinSearcher = this.joinIndex.acquire();
+    Predicate<String> isNeeded = fn -> true;
+
+    try {
+      existingJoinSegments = extractExistingJoinColumns(joinSearcher, isNeeded);
+    } finally {
+      this.joinIndex.release(joinSearcher);
+    }
+
     return new AIJoinWeight(
-        this, fromMatches, fromReader, searcher.getIndexReader(), scoreMode, boost);
+        this, joinSearcher, existingJoinSegments, fromReader, searcher.getIndexReader(), scoreMode, boost);
+  }
+
+  /*** TODO move to util or index */
+  static Map<String, JoinSegment> extractExistingJoinColumns(IndexSearcher joinSearcher, Predicate<String> isNeeded) {
+    Map<String, JoinSegment> existingJoinSegments;
+    existingJoinSegments = new HashMap<>(joinSearcher.getIndexReader().leaves().size());
+    for (LeafReaderContext joinContext : joinSearcher.getIndexReader().leaves()) {
+      String segmentName = AIJoinUtil.segmentName(joinContext);
+      for (FieldInfo fieldInfo : joinContext.reader().getFieldInfos()) {
+        String splits[] = fieldInfo.name.split(AIJoinUtil.TO_DOC_VAL_BY_FROM_DOCNUM);
+        if (splits.length == 2 && isNeeded.test(splits[1])) {
+            existingJoinSegments.computeIfAbsent(splits[1],
+              fieldName ->  new JoinSegment(fieldName, segmentName, joinContext.ord));
+        }
+      }
+    }
+    return existingJoinSegments;
   }
 
   @Override

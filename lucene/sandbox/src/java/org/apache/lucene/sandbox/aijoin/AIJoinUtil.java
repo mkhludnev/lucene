@@ -49,10 +49,13 @@ import org.apache.lucene.util.StringHelper;
 final class AIJoinUtil {
 
   /** Suffix of the always-written column persisting a pair's {min, max} from-doc edges. */
-  static final String FROM_EDGES_SUFFIX = "_fromDoc_edges";
+  static final String FROM_EDGES_PREFIX = "fromDoc_edges_"; //TODO reduce to the singe letter
 
   /** Suffix of the always-written column persisting a pair's {min, max} to-doc edges. */
-  static final String TO_EDGES_SUFFIX = "_toDoc_edges";
+  static final String TO_EDGES_PREFIX = "toDoc_edges_";
+
+  /** main join colums for join index to_doc_num[from_docnum] */
+  static final String TO_DOC_VAL_BY_FROM_DOCNUM = "join_toDoc_";
 
   private static final FieldType toDocsFieldType = new FieldType();
 
@@ -71,13 +74,32 @@ final class AIJoinUtil {
    * from-ord indexed merge buffer, safe to reuse for the next pair since the returned columns own
    * their per-doc arrays.
    */
-  static List<Column> mapPairOrdinals(
+  static List<Column> createJoinColumns(DocMapping mapping, String pairFieldName) {
+    return List.of(
+        ordMapBatch(pairFieldName, mapping.toDocByFromDoc()),
+        edgesColumn(FROM_EDGES_PREFIX + pairFieldName, mapping.fromDocEdges()),
+        edgesColumn(TO_EDGES_PREFIX + pairFieldName, mapping.toDocEdges()));
+  }
+
+  /**
+   * Doc-id bounds and the from-doc-to-to-doc map produced by {@link #computeDocMapping}:
+   * {@code fromDocEdges} and {@code toDocEdges} are each a pair's {min, max} doc bounds.
+   */
+  record DocMapping(int[] toDocByFromDoc, int[] fromDocEdges, int[] toDocEdges) {}
+
+  /**
+   * Merges the sorted term dictionaries of one (from-segment, to-segment) pair and resolves every
+   * from-side doc to its matching to-side doc id, along with the pair's from-doc and to-doc
+   * bounds. {@code scratch} is a shared from-ord indexed merge buffer, safe to reuse for the next
+   * pair.
+   */
+  static DocMapping computeDocMapping(
       LeafReaderContext fromContext,
       String fromField,
       LeafReaderContext toContext,
       String toField,
       long[] scratch)
-      throws IOException {
+      throws IOException {// TODO apply livedocs
     SortedSetDocValues fromDV = DocValues.getSortedSet(fromContext.reader(), fromField);
     SortedSetDocValues toDV = DocValues.getSortedSet(toContext.reader(), toField);
     // map from-segment ords to to-segment ords by merging the two sorted term dictionaries
@@ -148,14 +170,10 @@ final class AIJoinUtil {
         maxToDoc = Math.max(maxToDoc, toDoc);
       }
     }
-    String pairFieldName = pairFieldName(fromContext, fromField, toContext, toField);
-    return List.of(
-        ordMapBatch(
-            pairFieldName,
-            // fromContext, fromDV, toContext, toDV,
-            toDocByFromDoc),
-        edgesColumn(pairFieldName + FROM_EDGES_SUFFIX, new int[] {minFromDoc, maxFromDoc}),
-        edgesColumn(pairFieldName + TO_EDGES_SUFFIX, new int[] {minToDoc, maxToDoc}));
+    return new DocMapping(
+        toDocByFromDoc,
+        new int[] {minFromDoc, maxFromDoc},
+        new int[] {minToDoc, maxToDoc});
   }
 
   private static LongColumn edgesColumn(String fromEdgesFieldName, int[] fromDocEdges) {
@@ -202,7 +220,7 @@ final class AIJoinUtil {
   static Column ordMapBatch(String fieldName, int[] toDocByFromDoc) {
 
     Column column =
-        new LongColumn(fieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
+        new LongColumn(TO_DOC_VAL_BY_FROM_DOCNUM+fieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
           @Override
           public LongTupleCursor tuples() {
             return new LongTupleCursor() {
@@ -245,6 +263,7 @@ final class AIJoinUtil {
     // key is insensitive to deletes but changes when the join field's docvalues are updated.
     long dvGen = context.reader().getFieldInfos().fieldInfo(field).getDocValuesGen();
     String key = field + ":" + StringHelper.idToString(segmentId) + ":" + dvGen;
+    //TODO this is dangerous, no one flip them back
     return NON_IDENTIFIER.matcher(key).replaceAll("_");
   }
 
@@ -267,5 +286,10 @@ final class AIJoinUtil {
             "cannot unwrap a SegmentReader from " + reader.getClass().getName());
       }
     }
+  }
+
+  /** The name of the sidecar segment carrying the given join index leaf. */
+  static String segmentName(LeafReaderContext joinContext) {
+    return segmentReader(joinContext.reader()).getSegmentName();
   }
 }

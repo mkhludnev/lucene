@@ -18,6 +18,7 @@ package org.apache.lucene.sandbox.aijoin;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,6 +35,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.NoMergeScheduler;
+import org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocMapping;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.SearcherManager;
@@ -72,8 +74,17 @@ public final class AIJoinIndex implements Closeable {
    * pair, others wait on it. Completed futures stay put so a builder that raced a not-yet-visible
    * refresh cannot write a duplicate pair column.
    */
-  private final ConcurrentHashMap<String, CompletableFuture<Void>> pairBuilds =
+  private final ConcurrentHashMap<String, CompletableFuture<Map.Entry<String, DocMapping>>> pairBuilds =
       new ConcurrentHashMap<>();
+
+  /**
+   * One (from-segment, to-segment) pair's ordinal-map column: its field name and the name of the
+   * sidecar segment carrying it, so the column survives join reader refreshes.
+   */
+  record PairColumn(String pairFieldName, String joinSegmentName, int maxFromDoc, int [] toDocEdges) {}
+
+  /** A pair's (from-segment, to-segment) leaf ordinals. */
+  record SegmentsTuple(int fromLeafOrd, int toLeafOrd) {}
 
   private AIJoinIndex(Directory directory) throws IOException {
     this.directory = directory;
@@ -117,35 +128,33 @@ public final class AIJoinIndex implements Closeable {
     manager.release(searcher);
   }
 
-  /** The name of the sidecar segment carrying the given join index leaf. */
-  static String segmentName(LeafReaderContext joinContext) {
-    return AIJoinUtil.segmentReader(joinContext.reader()).getSegmentName();
-  }
-
   /**
    * Builds and persists the given missing pair columns, keyed by pair field name to their
    * (from-segment, to-segment) leaf ordinals. Pairs concurrently built by another thread are
    * awaited, not rebuilt. On return the internal searcher manager is refreshed past every
    * requested pair.
+   *
+   * @return in memory data for just written segemts
    */
-  void buildPairs(
-      Map<String, AIJoinQuery.SegmentsTuple> missingPairs,
+  Map<String, DocMapping> writeJoinSegments(
+      Map<String, SegmentsTuple> missingPairs,
       IndexReader fromReader,
       String fromField,
       IndexReader toReader,
       String toField)
       throws IOException {
-    Map<String, CompletableFuture<Void>> owned = new LinkedHashMap<>();
-    List<CompletableFuture<Void>> awaited = new ArrayList<>();
+    Map<String, CompletableFuture<Map.Entry<String, DocMapping>>> owned = new LinkedHashMap<>();
+    List<CompletableFuture<Map.Entry<String, DocMapping>>> awaited = new ArrayList<>();
     for (String pairFieldName : missingPairs.keySet()) {
-      CompletableFuture<Void> created = new CompletableFuture<>();
-      CompletableFuture<Void> existing = pairBuilds.putIfAbsent(pairFieldName, created);
+      CompletableFuture<Map.Entry<String, DocMapping>> created = new CompletableFuture<>();
+      CompletableFuture<Map.Entry<String, DocMapping>> existing = pairBuilds.putIfAbsent(pairFieldName, created);
       if (existing == null) {
         owned.put(pairFieldName, created);
       } else {
         awaited.add(existing);
       }
     }
+    Map<String,DocMapping> loadedMappings = new LinkedHashMap<>();
     try {
       if (!owned.isEmpty()) {
         // all owned pairs go into a single batch: pair columns are addressed by from-side doc id,
@@ -154,33 +163,45 @@ public final class AIJoinIndex implements Closeable {
         List<Column> columns = new ArrayList<>();
         int batchNumDocs = 0;
         for (String pairFieldName : owned.keySet()) {
-          AIJoinQuery.SegmentsTuple position = missingPairs.get(pairFieldName);
+          SegmentsTuple position = missingPairs.get(pairFieldName);
           LeafReaderContext toContext = toReader.leaves().get(position.toLeafOrd());
           LeafReaderContext fromContext = fromReader.leaves().get(position.fromLeafOrd());
           long[] scratch =
               new long
                   [Math.toIntExact(
                       DocValues.getSortedSet(fromContext.reader(), fromField).getValueCount())];
-          columns.addAll(
-              AIJoinUtil.mapPairOrdinals(fromContext, fromField, toContext, toField, scratch));
+          AIJoinUtil.DocMapping mapping =
+              AIJoinUtil.computeDocMapping(fromContext, fromField, toContext, toField, scratch);
+          columns.addAll( // what if there's no hits ???!! TODO needs to wite a thumbnail??
+              AIJoinUtil.createJoinColumns(mapping, pairFieldName));
           batchNumDocs = Math.max(batchNumDocs, fromContext.reader().maxDoc());
+          loadedMappings.put(pairFieldName, mapping);
         }
         writeBatch(batchNumDocs, columns);
-        for (CompletableFuture<Void> future : owned.values()) {
-          future.complete(null);
+        //TODO flush every single field to get single field segments
+        for (Map.Entry<String, CompletableFuture<Map.Entry<String, DocMapping>>> entry :
+            owned.entrySet()) {
+          entry
+              .getValue()
+              .complete(
+                  new AbstractMap.SimpleImmutableEntry<>(
+                      entry.getKey(), loadedMappings.get(entry.getKey())));
         }
       }
     } catch (Throwable t) {
       // withdraw the claims so a later query can retry the build
-      for (Map.Entry<String, CompletableFuture<Void>> entry : owned.entrySet()) {
+      for (Map.Entry<String, CompletableFuture<Map.Entry<String, DocMapping>>> entry :
+          owned.entrySet()) {
         pairBuilds.remove(entry.getKey(), entry.getValue());
         entry.getValue().completeExceptionally(t);
       }
       throw t;
     }
-    for (CompletableFuture<Void> future : awaited) {
+    Map<String, DocMapping> result = new LinkedHashMap<>(loadedMappings);
+    for (CompletableFuture<Map.Entry<String, DocMapping>> future : awaited) {
       try {
-        future.join();
+        Map.Entry<String, DocMapping> entry = future.join();
+        result.put(entry.getKey(), entry.getValue());
       } catch (CompletionException e) {
         Throwable cause = e.getCause();
         if (cause instanceof IOException ioe) {
@@ -192,6 +213,7 @@ public final class AIJoinIndex implements Closeable {
         throw new IOException(cause);
       }
     }
+    return result;
   }
 
   /**
