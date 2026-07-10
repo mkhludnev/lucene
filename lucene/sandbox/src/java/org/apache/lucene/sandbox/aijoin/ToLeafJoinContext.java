@@ -64,7 +64,7 @@ class ToLeafJoinContext {
   private final Map<String, JoinCell> joinCellsByPairFieldName = new HashMap<>();
 
   /** represents a cell in the join matrix bounded to from and to segments */
-  class JoinCell{
+  class JoinCell implements DocEdges {
     final String pairFieldName;
     final DocIdSetIterator fromSegmentDocIdIter;
     final JoinSegmentReference weightAgeJoinSegment;
@@ -81,6 +81,16 @@ class ToLeafJoinContext {
       this.segmentsFromTo = segmentsFromTo;
       this.fromSegmentDocIdIter = fromSegmentDocIdIter;
       this.weightAgeJoinSegment = weightAgeJoinSegment;
+    }
+
+    @Override
+    public int[] fromDocEdges() {
+      return pairColumn != null ? pairColumn.fromDocEdges() : docMapping.fromDocEdges();
+    }
+
+    @Override
+    public int[] toDocEdges() {
+      return pairColumn != null ? pairColumn.toDocEdges() : docMapping.toDocEdges();
     }
   }
 
@@ -180,36 +190,18 @@ class ToLeafJoinContext {
     // first pass: union the contributing pairs' to-doc ranges; every possible match in this
     // to segment falls into [minToDoc, maxToDoc]
     for (JoinCell cell : joinCells) {
-      String pairFieldName = cell.pairFieldName;
-      {
-        PairColumn pairColumn = cell.pairColumn;
-        if (pairColumn !=null) {
-          // this join segment was not found in the join index, so it was built on demand
-          // and is now available via cell.docMapping
-          firstToDoc = Math.min(firstToDoc, pairColumn.toDocEdges()[0]);
-          lastToDoc = Math.max(lastToDoc, pairColumn.toDocEdges()[1]);
-          matchedToDocsCount += pairColumn.toDocEdges()[1]-pairColumn.toDocEdges()[0]+1;
-          if (toApproximation == null) {
-            toApproximation = new FixedBitSet(toContext.reader().maxDoc());
-          }
-          toApproximation.set(pairColumn.toDocEdges()[0], pairColumn.toDocEdges()[1] + 1);
-          continue;
-        } // now fall back to fresh writes
+      DocEdges docEdges = cell.pairColumn != null ? cell.pairColumn : cell.docMapping;
+      if (docEdges == null) {
+        throw new IllegalStateException(
+            "join segment not found in loaded or new join segments: " + cell.pairFieldName);
       }
-      {
-        DocMapping docMapping = cell.docMapping;
-        if (docMapping != null) {
-          firstToDoc = Math.min(firstToDoc, docMapping.toDocEdges()[0]);
-          lastToDoc = Math.max(lastToDoc, docMapping.toDocEdges()[1]);
-          matchedToDocsCount += docMapping.toDocEdges()[1]-docMapping.toDocEdges()[0]+1;
-          if (toApproximation == null) {
-            toApproximation = new FixedBitSet(toContext.reader().maxDoc());
-          }
-          toApproximation.set(docMapping.toDocEdges()[0], docMapping.toDocEdges()[1] + 1);
-          continue;
-        }
+      firstToDoc = Math.min(firstToDoc, docEdges.toDocEdges()[0]);
+      lastToDoc = Math.max(lastToDoc, docEdges.toDocEdges()[1]);
+      matchedToDocsCount += docEdges.toDocEdges()[1] - docEdges.toDocEdges()[0] + 1;
+      if (toApproximation == null) {
+        toApproximation = new FixedBitSet(toContext.reader().maxDoc());
       }
-      throw new IllegalStateException("join segment not found in loaded or new join segments: " + pairFieldName);
+      toApproximation.set(docEdges.toDocEdges()[0], docEdges.toDocEdges()[1] + 1);
     }
   }
 
@@ -220,32 +212,45 @@ class ToLeafJoinContext {
       if (docMapping == null) {
         continue; // pair was already found on disk, not freshly built this round
       }
-      DocIdSetIterator fromSegemtIter = cell.fromSegmentDocIdIter;
-      int[] fromDocEdges = docMapping.fromDocEdges();
-      int minFromDoc = fromDocEdges[0];
-      int maxFromDoc = fromDocEdges[1];
-      if (minFromDoc < 0) {
-        // {-1, -1} sentinel: this pair maps no from doc to any to doc at all
-        removeJoinCell(cell);
-        continue;
-      }
-      if (maxFromDoc >=0 && maxFromDoc!=DocIdSetIterator.NO_MORE_DOCS
-        && fromSegemtIter.docID() > maxFromDoc) {
-        // from iter is already past the last from doc this pair maps, so it cannot contribute
-        removeJoinCell(cell); // no more matches in this join segment, so the pair cannot contribute
-        continue;
-      }
-      if (minFromDoc >= 0 && maxFromDoc!=DocIdSetIterator.NO_MORE_DOCS
-        &&  fromSegemtIter.docID() < minFromDoc) {
-        int firstMatch = fromSegemtIter.advance(minFromDoc);
-        if (firstMatch == DocIdSetIterator.NO_MORE_DOCS || firstMatch > maxFromDoc) {
-          /// wow from iter exhausted, no match in this join segment, so the pair cannot contribute
-          // thus we need to return them from request `
-          removeJoinCell(cell); // no more matches in this join segment, so the pair cannot contribute
-          continue;
-        }// else from iter is advanced behind the first from match , good
-      }
+      advanceAtMinFromEdge(cell);
     }
+  }
+
+  /**
+   * Positions {@code cell}'s from-iterator behind {@code docEdges}'s first from-doc, or drops
+   * {@code cell} via {@link #removeJoinCell} when the iterator can no longer reach any doc the
+   * pair maps -- either because the pair maps nothing ({-1, -1} sentinel), the iterator already
+   * moved past the pair's last from-doc, or it exhausts before reaching the pair's first one (the
+   * iterator only moves forward, so none of these are recoverable). Returns whether the cell
+   * survives.
+   */
+  private boolean advanceAtMinFromEdge(JoinCell cell) throws IOException {
+    int[] fromDocEdges = cell.fromDocEdges();
+    int minFromDoc = fromDocEdges[0];
+    int maxFromDoc = fromDocEdges[1];
+    DocIdSetIterator fromSegemtIter = cell.fromSegmentDocIdIter;
+    if (minFromDoc < 0) {
+      // {-1, -1} sentinel: this pair maps no from doc to any to doc at all
+      removeJoinCell(cell);
+      return false;
+    }
+    if (maxFromDoc >=0 && maxFromDoc!=DocIdSetIterator.NO_MORE_DOCS
+      && fromSegemtIter.docID() > maxFromDoc) {
+      // from iter is already past the last from doc this pair maps, so it cannot contribute
+      removeJoinCell(cell); // no more matches in this join segment, so the pair cannot contribute
+      return false;
+    }
+    if (minFromDoc >= 0 && maxFromDoc!=DocIdSetIterator.NO_MORE_DOCS
+      &&  fromSegemtIter.docID() < minFromDoc) {
+      int firstMatch = fromSegemtIter.advance(minFromDoc);
+      if (firstMatch == DocIdSetIterator.NO_MORE_DOCS || firstMatch > maxFromDoc) {
+        /// wow from iter exhausted, no match in this join segment, so the pair cannot contribute
+        // thus we need to return them from request `
+        removeJoinCell(cell); // no more matches in this join segment, so the pair cannot contribute
+        return false;
+      }// else from iter is advanced behind the first from match , good
+    }
+    return true;
   }
 
   /**
@@ -282,42 +287,17 @@ class ToLeafJoinContext {
         LeafReaderContext joinFeafSeg = scorerSupplierAgeJoinSearcher.getLeafContexts().get(joinSegment.joinSegmentLeafOrd()); // validate the join segment is still present
         assert AIJoinUtil.segmentName(joinFeafSeg).equals(joinSegment.joinSegmentName());
 
-        int[] fromDocEdges = ToLeafJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.FROM_EDGES_PREFIX + pairFieldName);
-        int minFromDoc = fromDocEdges[0];
-        int maxFromDoc = fromDocEdges[1];
-        // check if from matche hits this join segment
 
-        DocIdSetIterator fromSegemtIter = cell.fromSegmentDocIdIter;
-        if (minFromDoc < 0) {
-          // {-1, -1} sentinel: this pair maps no from doc to any to doc at all
-          removeJoinCell(cell); // no more matches in this join segment, so the pair cannot contribute
-          continue;
-        }
-        if (maxFromDoc >=0 && maxFromDoc!=DocIdSetIterator.NO_MORE_DOCS
-          && fromSegemtIter.docID() > maxFromDoc) {
-          // from iter is already past the last from doc this pair maps, so it cannot contribute
-          removeJoinCell(cell); // no more matches in this join segment, so the pair cannot contribute
-          continue;
-        }
-        if (minFromDoc >= 0 && maxFromDoc!=DocIdSetIterator.NO_MORE_DOCS
-          &&  fromSegemtIter.docID() < minFromDoc) {
-          int firstMatch = fromSegemtIter.advance(minFromDoc);
-          if (firstMatch == DocIdSetIterator.NO_MORE_DOCS || firstMatch > maxFromDoc) {
-            /// wow from iter exhausted, no match in this join segment, so the pair cannot contribute
-            // thus we need to return them from request `
-            removeJoinCell(cell); // no more matches in this join segment, so the pair cannot contribute
-            continue;
-          }// else from iter is advanced behind the first from match , good
-        }
-        cell.pairColumn = // ok. this one is ready for search.
+        cell.pairColumn = // ok. this one may be ready for search.
             new PairColumn(
                 pairFieldName,
                 joinSegment.joinSegmentName(),
-                fromDocEdges,
+                ToLeafJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.FROM_EDGES_PREFIX + pairFieldName),
                 ToLeafJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.TO_EDGES_PREFIX + pairFieldName),
                 // TODO use it for ordefing join segment iteration, desc
                 ToLeafJoinContext.loadEdges(joinFeafSeg, AIJoinUtil.TO_COUNT_PREFIX + pairFieldName)[0]
               );
+        advanceAtMinFromEdge(cell);
       }
     }
     return notFound;
