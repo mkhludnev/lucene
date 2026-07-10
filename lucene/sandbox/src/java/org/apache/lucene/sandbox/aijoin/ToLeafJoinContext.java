@@ -25,11 +25,10 @@ import java.util.concurrent.ThreadLocalRandom;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedNumericDocValues;
-import org.apache.lucene.sandbox.aijoin.AIJoinIndex.PairColumn;
+import org.apache.lucene.sandbox.aijoin.AIJoinIndex.JoinSegmentReference;
 import org.apache.lucene.sandbox.aijoin.AIJoinIndex.SegmentsTuple;
-import org.apache.lucene.sandbox.aijoin.AIJoinQuery.JoinSegmentReference;
 import org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocEdges;
-import org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocMapping;
+import org.apache.lucene.sandbox.aijoin.AIJoinUtil.JoinColumnModel;
 import org.apache.lucene.search.ConstantScoreScorer;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.FilteredDocIdSetIterator;
@@ -69,69 +68,21 @@ class ToLeafJoinContext {
   private IndexReader toReader;
 
   /**
-   * How a resolved {@link JoinTask}'s edges and to-doc values are read: either a join-index
-   * -persisted {@link PairColumn}, addressed through the cell's (possibly refreshed) {@link
-   * JoinTask#joinSegmentRef}, or a {@link DocMapping} built on demand and held entirely in
-   * memory. Replaces a pair of nullable {@code JoinTask} fields so a cell is resolved as exactly
-   * one of the two, never both, never neither.
+   * Represents a cell in the join matrix bounded to from and to segments. Resolved exactly once,
+   * either from the join index ({@link #resolveFromIndex}: just the pair's {@link DocEdges}, with
+   * real docvalues opened later, on demand, through {@link #joinSegmentRef} -- which keeps being
+   * refreshed as the join reader reopens -- or from the indexer ({@link #resolveFromIndexer}: the
+   * pair's edges plus an in-memory {@link JoinColumnModel} that needs no further indirection to read.
    */
-  sealed interface FromToRelation extends DocEdges {
-    /** it's like PARENT_FK_DOCNUM */
-    SortedNumericDocValues toDocsByFromDocsDV(JoinTask owner, IndexSearcher lastSeenJoinSearcher)
-        throws IOException;
-  }
-
-  record ByJoinIndexSegment(PairColumn pairColumn) implements FromToRelation {
-    @Override
-    public int[] fromDocEdges() {
-      return pairColumn.fromDocEdges();
-    }
-
-    @Override
-    public int[] toDocEdges() {
-      return pairColumn.toDocEdges();
-    }
-
-    @Override
-    public SortedNumericDocValues toDocsByFromDocsDV(JoinTask owner, IndexSearcher lastSeenJoinSearcher)
-        throws IOException {
-      // validate the join segment is still present
-      LeafReaderContext joinContext =
-          lastSeenJoinSearcher.getLeafContexts().get(owner.joinSegmentRef.joinSegmentLeafOrd());
-      assert AIJoinUtil.segmentName(joinContext).equals(owner.joinSegmentRef.joinSegmentName());
-      return joinContext
-          .reader()
-          .getSortedNumericDocValues(
-              AIJoinUtil.TO_DOC_VAL_BY_FROM_DOCNUM + pairColumn.pairFieldName());
-    }
-  }
-
-  record ByArray(DocMapping docMapping) implements FromToRelation {
-    @Override
-    public int[] fromDocEdges() {
-      return docMapping.fromDocEdges();
-    }
-
-    @Override
-    public int[] toDocEdges() {
-      return docMapping.toDocEdges();
-    }
-
-    @Override
-    public SortedNumericDocValues toDocsByFromDocsDV(JoinTask owner, IndexSearcher lastSeenJoinSearcher) {
-      // this join segment was not found in the join index, so it was built on demand and is
-      // now available via docMapping directly, with no searcher involved
-      return docMapping.toDocByFromDoc();
-    }
-  }
-
-  /** represents a cell in the join matrix bounded to from and to segments */
   class JoinTask implements DocEdges {
     final String pairFieldName;
     final DocIdSetIterator fromSegmentDocIdIter;
     JoinSegmentReference joinSegmentRef;
     final SegmentsTuple segmentsFromTo;
-    private FromToRelation resolved;
+    private DocEdges edges;
+    // set only when resolved from the indexer; null means real docvalues are opened through
+    // joinSegmentRef instead
+    private JoinColumnModel docMapping;
 
     JoinTask(
         String pairFieldName,
@@ -144,35 +95,78 @@ class ToLeafJoinContext {
       assert fromSegmentDocIdIter.docID() >= 0;
     }
 
-    /** Resolves this cell, once, to a join-index-persisted pair column. */
-    void resolveColumn(PairColumn pairColumn) {
-      assert resolved == null : "already resolved: " + resolved;
-      resolved = new ByJoinIndexSegment(pairColumn);
+    /** Resolves this cell, once, to a join-index-persisted pair's edges. */
+    void resolveFromIndex(DocEdges edges) {
+      assert this.edges == null : "already resolved: " + this.edges;
+      this.edges = edges;
     }
 
     /** Resolves this cell, once, to an in-memory doc mapping built on demand. */
-    void resolveMapping(DocMapping docMapping) {
-      assert resolved == null : "already resolved: " + resolved;
-      resolved = new ByArray(docMapping);
+    void resolveFromIndexer(JoinColumnModel docMapping) {
+      assert this.edges == null : "already resolved: " + this.edges;
+      this.edges = docMapping.edges();
+      this.docMapping = docMapping;
     }
 
     boolean isResolved() {
-      return resolved != null;
+      return edges != null;
     }
 
     SortedNumericDocValues toDocsByFromDocsDV() throws IOException {
-      assert resolved != null : "not resolved yet: " + this;
-      return resolved.toDocsByFromDocsDV(this, ToLeafJoinContext.this.lastSeenJoinSearcher);
+      assert edges != null : "not resolved yet: " + this;
+      if (docMapping != null) {
+        // built on demand, so it's available directly, with no searcher involved
+        return docMapping.toDocByFromDoc();
+      }
+      // resolved from the join index: joinSegmentRef locates the real, on-disk column
+      LeafReaderContext joinContext =
+          lastSeenJoinSearcher.getLeafContexts().get(joinSegmentRef.joinSegmentLeafOrd());
+      assert AIJoinUtil.segmentName(joinContext).equals(joinSegmentRef.joinSegmentName());
+      return joinContext
+          .reader()
+          .getSortedNumericDocValues(AIJoinUtil.TO_DOC_VAL_BY_FROM_DOCNUM + joinSegmentRef.pairFieldName());
+    }
+
+    /**
+     * Walks this cell's from-iterator from its current (prepositioned) doc through its edges'
+     * last from-doc, setting every to-doc it maps to -- shifted by {@code shift} -- in {@code
+     * matchedToDocs}.
+     */
+    void dumpMatchesInto(FixedBitSet matchedToDocs, int shift) throws IOException {
+      SortedNumericDocValues toDocsByFromDoc = toDocsByFromDocsDV();
+      for (int fromDoc = fromSegmentDocIdIter.docID(); // prepositioned to the first match
+          fromDoc != DocIdSetIterator.NO_MORE_DOCS && fromDoc <= fromDocEdges()[1];
+          fromDoc = fromSegmentDocIdIter.nextDoc()) {
+        if (toDocsByFromDoc.advanceExact(fromDoc)) {
+          for (int i = 0; i < toDocsByFromDoc.docValueCount(); i++) {
+            int toDocMatch = (int) toDocsByFromDoc.nextValue();
+            assert toDocMatch <= toDocEdges()[1] && toDocMatch >= toDocEdges()[0]
+                : "to doc " + toDocMatch + " above edges union max " + Arrays.toString(toDocEdges());
+            // shift is wherever the approximation iterator first landed, which need not be
+            // the global firstToDoc (e.g. under a boolean conjunction); a match below shift
+            // is unreachable -- the iterator only moves forward -- so it's dropped rather
+            // than written at a negative offset
+            if (toDocMatch >= shift) {
+              matchedToDocs.set(toDocMatch - shift);
+            }
+          }
+        }
+      }
     }
 
     @Override
     public int[] fromDocEdges() {
-      return resolved.fromDocEdges();
+      return edges.fromDocEdges();
     }
 
     @Override
     public int[] toDocEdges() {
-      return resolved.toDocEdges();
+      return edges.toDocEdges();
+    }
+
+    @Override
+    public int toCount() {
+      return edges.toCount();
     }
   }
 
@@ -206,24 +200,9 @@ class ToLeafJoinContext {
     return joinCellsByPairFieldName.get(pairFieldName);
   }
 
-  /**
-   * A lazy view of every cell's weight-age {@link JoinSegmentReference} as a (pairFieldName, segment)
-   * entry, skipping cells without one -- equivalent to iterating a {@code Map<String,
-   * JoinSegment>} of just the weight-age segments, but read off {@link JoinTask#joinSegmentRef}
-   * instead of keeping a separate map around.
-   */
-  private Iterable<Map.Entry<String, JoinSegmentReference>> weightAgeJoinSegmentEntries() {
-    return () ->
-        joinCellsByPairFieldName.entrySet().stream()
-            .filter(e -> e.getValue().joinSegmentRef != null)
-            .<Map.Entry<String, JoinSegmentReference>>map(
-                e -> Map.entry(e.getKey(), e.getValue().joinSegmentRef))
-            .iterator();
-  }
-
   record TaskRefreshResult(
      Set<Map.Entry<JoinTask,LeafReaderContext>> joinSegements,
-    Set<Map.Entry<JoinTask,DocMapping>> justWritten
+    Set<Map.Entry<JoinTask,JoinColumnModel>> justWritten
   ){}
   /**
    *
@@ -264,20 +243,17 @@ class ToLeafJoinContext {
       LeafReaderContext joinLeaf = entry.getValue(); //got it from searcher leafs by refOrd
       assert AIJoinUtil.segmentName(joinLeaf).equals(cell.joinSegmentRef.joinSegmentName());
       assert joinLeaf.ord == cell.joinSegmentRef.joinSegmentLeafOrd();
-      cell.resolveColumn( // ok. this one may be ready for search.
-          new PairColumn(
-              cell.pairFieldName,
-              cell.joinSegmentRef.joinSegmentName(), //should be in sync
-              cell.joinSegmentRef.joinSegmentLeafOrd(),
-              ToLeafJoinContext.loadEdges(joinLeaf, AIJoinUtil.FROM_EDGES_PREFIX + cell.pairFieldName),
-              ToLeafJoinContext.loadEdges(joinLeaf, AIJoinUtil.TO_EDGES_PREFIX + cell.pairFieldName),
+      cell.resolveFromIndex( // ok. this one may be ready for search.
+          new AIJoinUtil.Edges(
+              AIJoinUtil.loadEdges(joinLeaf, AIJoinUtil.FROM_EDGES_PREFIX + cell.pairFieldName),
+              AIJoinUtil.loadEdges(joinLeaf, AIJoinUtil.TO_EDGES_PREFIX + cell.pairFieldName),
               // TODO use it for ordefing join segment iteration, desc
-              ToLeafJoinContext.loadEdges(joinLeaf, AIJoinUtil.TO_COUNT_PREFIX + cell.pairFieldName)[0]
+              AIJoinUtil.loadEdges(joinLeaf, AIJoinUtil.TO_COUNT_PREFIX + cell.pairFieldName)[0]
             ));
     }
-    for (Entry<JoinTask, DocMapping> entry : refreshedAndNew.justWritten) {
+    for (Entry<JoinTask, JoinColumnModel> entry : refreshedAndNew.justWritten) {
       JoinTask cell = entry.getKey();
-      cell.resolveMapping(entry.getValue());
+      cell.resolveFromIndexer(entry.getValue());
     }
     // edges are  loaded
     for (JoinTask cell : List.copyOf(joinCells)){ // hell. it might remove task from the list. that's sad. I have to copy it.
@@ -285,7 +261,7 @@ class ToLeafJoinContext {
       // a little bit tricky. It assumes that column is join-index backed or just written and array-backed,
       advanceAtMinFromEdge(cell);
     }
-    // now let's read each cell's pairColumn, then docMapping, and build "to" side bitset of approximation
+    // now let's read each cell's edges, then build "to" side bitset of approximation
     // first pass: union the contributing pairs' to-doc ranges; every possible match in this
     // to segment falls into [minToDoc, maxToDoc]
     for (JoinTask cell : joinCells) {
@@ -302,7 +278,7 @@ class ToLeafJoinContext {
 
   private TaskRefreshResult refreshJoinTasksReferences(IndexSearcher newJoinIndexSearcher) throws IOException {
     Set<Map.Entry<JoinTask,LeafReaderContext>> joinSegements = new LinkedHashSet<>();
-    Set<Map.Entry<JoinTask,DocMapping>> justWritten = new LinkedHashSet<>();
+    Set<Map.Entry<JoinTask,JoinColumnModel>> justWritten = new LinkedHashSet<>();
 
     Set<JoinTask> refeshReference = new LinkedHashSet<>();
     Set<JoinTask> loadReference = new LinkedHashSet<>();
@@ -320,18 +296,20 @@ class ToLeafJoinContext {
         needIndex.put(task.pairFieldName, task);
       }
     }
-    // referesh old refs, pass 1
+    // referesh old refs, pass 1: same ord, same segment name -> the leaf is already in hand, so
+    // resolve straight into joinSegements instead of adding to loadReference just to re-fetch the
+    // very same leaf by ord in the "load edges for regulars" loop below
     List<LeafReaderContext> newLeaves = newJoinIndexSearcher.getLeafContexts();
     for(Iterator<JoinTask> iter = refeshReference.iterator(); iter.hasNext(); ) {
       JoinTask task = iter.next();
-      // check segment name by ord, if true, put to load, remove from here
+      // check segment name by ord, if true, resolve it right here, remove from here
       LeafReaderContext byOrd =
           task.joinSegmentRef.joinSegmentLeafOrd() < newLeaves.size()
               ? newLeaves.get(task.joinSegmentRef.joinSegmentLeafOrd())
               : null;
       if (byOrd != null &&
         AIJoinUtil.segmentName(byOrd).equals(task.joinSegmentRef.joinSegmentName())) {
-        loadReference.add(task);
+        joinSegements.add(new SimpleEntry<>(task, byOrd));
         iter.remove();
       }
     }
@@ -344,11 +322,13 @@ class ToLeafJoinContext {
       for (LeafReaderContext joinLeaf : newLeaves) {
         String segName = AIJoinUtil.segmentName(joinLeaf);
         JoinTask task = byOldJoinSegName.get(segName);
-        if (task != null) { //TODO we got a segment right here
+        if (task != null) {
+          // renamed segment, found by scanning for its old name -- joinLeaf is already the
+          // resolved leaf, so resolve straight into joinSegements, same as pass 1
           task.joinSegmentRef =
               new JoinSegmentReference(
                   task.joinSegmentRef.pairFieldName(), segName, joinLeaf.ord);
-          loadReference.add(task);
+          joinSegements.add(new SimpleEntry<>(task, joinLeaf));
           refeshReference.remove(task);
         }
       }
@@ -360,7 +340,7 @@ class ToLeafJoinContext {
         byPairFieldName.put(task.joinSegmentRef.pairFieldName(), task);
       }
       // loop join segments search for fields
-      Map<String, JoinSegmentReference> joinSegmentsByPairFieldName = AIJoinQuery.extractExistingJoinColumns(lastSeenJoinSearcher, byPairFieldName::containsKey);
+      Map<String, JoinSegmentReference> joinSegmentsByPairFieldName = AIJoinIndex.extractExistingJoinColumns(lastSeenJoinSearcher, byPairFieldName::containsKey);
       // if found move to load set
       for (JoinTask task :byPairFieldName.values()){
         JoinSegmentReference found = joinSegmentsByPairFieldName.get(task.pairFieldName);
@@ -389,13 +369,13 @@ class ToLeafJoinContext {
       for (JoinTask cell : needIndex.values()) {
         missingPairs.put(cell.pairFieldName, cell.segmentsFromTo);
       }
-      Map<String, DocMapping> written = this.joinIndex.writeJoinSegments(
+      Map<String, JoinColumnModel> written = this.joinIndex.writeJoinSegments(
         Collections.unmodifiableMap(missingPairs),
        cachedFromSearcher.getIndexReader()
         , this.fromField, this.toReader, this.toField);
       assert written.keySet().containsAll(missingPairs.keySet());
       assert missingPairs.keySet().containsAll(written.keySet());
-      for (Map.Entry<String, DocMapping> entry : written.entrySet()) {//TODO optimize
+      for (Map.Entry<String, JoinColumnModel> entry : written.entrySet()) {//TODO optimize
         JoinTask cell = needIndex.get(entry.getKey());
         justWritten.add(new SimpleEntry<>(cell, entry.getValue()));
       }
@@ -498,24 +478,6 @@ class ToLeafJoinContext {
     return tasks;
   }
 
-  /** Reads a pair's persisted values, all stored on doc 0 of the column.
-   * TODO move it somewhere
-  */
-  static int[] loadEdges(LeafReaderContext joinContext, String edgesFieldName)
-      throws IOException {
-    SortedNumericDocValues edgesDV =
-        joinContext.reader().getSortedNumericDocValues(edgesFieldName);
-    assert edgesDV != null : "expected edges column to be present: " + edgesFieldName;
-    int zeroDoc = edgesDV.nextDoc();
-    assert zeroDoc == 0
-        : "expected edges column to be fully materialized, but got doc " + zeroDoc;
-    int[] values = new int[edgesDV.docValueCount()];
-    for (int i = 0; i < values.length; i++) {
-      values[i] = (int) edgesDV.nextValue();
-    }
-    return values;
-  }
-
   public ScorerSupplier scorerSupplier(ScoreMode scoreMode, float boost) {
     if (toApproximation == null || matchedToDocsCount == 0) {
       return null; // no matches in this to segment
@@ -591,32 +553,11 @@ class ToLeafJoinContext {
       refreshJoinTasksReferences(freshSearcher);
       assert this.lastSeenJoinSearcher == freshSearcher;
       for (JoinTask cell : joinCells) {
-        SortedNumericDocValues toDocsByFromDoc = cell.toDocsByFromDocsDV();
-        dumpToMatches(shift, matchedToDocs, cell, cell, toDocsByFromDoc);
+        cell.dumpMatchesInto(matchedToDocs, shift);
       }
     } finally {//TODO release before looping remaining cells separately
       this.joinIndex.release(freshSearcher);
     }
     return matchedToDocs;
-  }
-
-  static private void dumpToMatches(int shift, FixedBitSet matchedToDocs, JoinTask cell, DocEdges docEdges, SortedNumericDocValues toDocsByFromDoc) throws IOException {
-    DocIdSetIterator matchedFromDocs = cell.fromSegmentDocIdIter;
-    for (int fromDoc = matchedFromDocs.docID(); // prepositioned to the first match
-        fromDoc != DocIdSetIterator.NO_MORE_DOCS && fromDoc <= docEdges.fromDocEdges()[1]; fromDoc = matchedFromDocs.nextDoc()) {
-      if (toDocsByFromDoc.advanceExact(fromDoc)) {
-        for (int i = 0; i < toDocsByFromDoc.docValueCount(); i++) {
-          int toDocMatch = (int) toDocsByFromDoc.nextValue();
-          assert toDocMatch <= docEdges.toDocEdges()[1] && toDocMatch >= docEdges.toDocEdges()[0] : "to doc " + toDocMatch + " above edges union max " + Arrays.toString(docEdges.toDocEdges());
-          // shift is wherever the approximation iterator first landed, which need not be
-          // the global firstToDoc (e.g. under a boolean conjunction); a match below shift
-          // is unreachable -- the iterator only moves forward -- so it's dropped rather
-          // than written at a negative offset
-          if (toDocMatch >= shift) {
-            matchedToDocs.set(toDocMatch - shift);
-          }
-        }
-      }
-    }
   }
 }

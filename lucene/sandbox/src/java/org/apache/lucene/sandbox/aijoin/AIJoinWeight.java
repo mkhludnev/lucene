@@ -4,7 +4,7 @@ import java.io.IOException;
 import java.util.Map;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.sandbox.aijoin.AIJoinQuery.JoinSegmentReference;
+import org.apache.lucene.sandbox.aijoin.AIJoinIndex.JoinSegmentReference;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.ScoreMode;

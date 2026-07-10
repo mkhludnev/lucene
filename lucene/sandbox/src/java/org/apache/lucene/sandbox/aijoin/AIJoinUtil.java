@@ -79,44 +79,45 @@ final class AIJoinUtil {
    * from-ord indexed merge buffer, safe to reuse for the next pair since the returned columns own
    * their per-doc arrays.
    */
-  static List<Column> createJoinColumns(DocMapping mapping, String pairFieldName) {
+  static List<Column> createJoinColumns(JoinColumnModel mapping, String pairFieldName) {
     return List.of(
         ordMapBatch(pairFieldName, mapping),
-        edgesColumn(FROM_EDGES_PREFIX + pairFieldName, mapping.fromDocEdges()),
-        edgesColumn(TO_EDGES_PREFIX + pairFieldName, mapping.toDocEdges()),
-        edgesColumn(TO_COUNT_PREFIX + pairFieldName, new int[] {mapping.toCount()})
+        edgesColumn(FROM_EDGES_PREFIX + pairFieldName, mapping.edges().fromDocEdges()),
+        edgesColumn(TO_EDGES_PREFIX + pairFieldName, mapping.edges().toDocEdges()),
+        edgesColumn(TO_COUNT_PREFIX + pairFieldName, new int[] {mapping.edges().toCount()})
       );
   }
 
   /**
-   * A pair's {min, max} from-doc and to-doc bounds, common to both a pair freshly built on demand
-   * ({@link DocMapping}) and one already persisted in the join index ({@link
-   * AIJoinIndex.PairColumn}), so code walking matches doesn't need to care which one backs it.
+   * A pair's {min, max} from-doc and to-doc bounds and match count, common to both a pair freshly
+   * built on demand ({@link JoinColumnModel#edges()}) and one already persisted in the join index
+   * ({@link Edges}, loaded through {@link #loadEdges}), so code walking matches doesn't need to
+   * care which one backs it.
    */
   interface DocEdges {
     int[] fromDocEdges();
 
     int[] toDocEdges();
+    /** this is rather doubtful */
+    int toCount();
   }
 
-  /**
-   * Doc-id bounds and the from-doc-to-to-doc map produced by {@link #computeDocMapping}:
-   * {@code fromDocEdges} and {@code toDocEdges} are each a pair's {min, max} doc bounds.
-   * {@link #toDocByFromDoc()} mirrors the on-disk column's read API, so freshly built pairs (not
-   * yet flushed to the join index) and pairs loaded from the join index can be walked by the same
-   * code.
-   */
-  static final class DocMapping implements DocEdges {
-    private final int[] toDocByFromDoc;
-    private final int[] fromDocEdges;
-    private final int[] toDocEdges;
-    private int toCount;
+  /** A self-contained {@link DocEdges} value, with no addressing information of its own. */
+  record Edges(int[] fromDocEdges, int[] toDocEdges, int toCount) implements DocEdges {}
 
-    DocMapping(int[] toDocByFromDoc, int toCount, int[] fromDocEdges, int[] toDocEdges) {
+  /**
+   * The from-doc-to-to-doc map produced by {@link #computeDocMapping}, paired with its resolved
+   * {@link #edges()}. {@link #toDocByFromDoc()} mirrors the on-disk column's read API, so freshly
+   * built pairs (not yet flushed to the join index) and pairs loaded from the join index can be
+   * walked by the same code.
+   */
+  static final class JoinColumnModel {
+    private final int[] toDocByFromDoc;
+    private final DocEdges edges;
+
+    JoinColumnModel(int[] toDocByFromDoc, DocEdges edges) {
       this.toDocByFromDoc = toDocByFromDoc;
-      this.fromDocEdges = fromDocEdges;
-      this.toDocEdges = toDocEdges;
-      this.toCount = toCount;
+      this.edges = edges;
     }
 
     /** Returns a fresh single-valued cursor over the from-doc -> to-doc map, positioned before doc 0. */
@@ -124,18 +125,8 @@ final class AIJoinUtil {
       return new ArrayBackedSortedNumericDocValues(toDocByFromDoc);
     }
 
-    @Override
-    public int[] fromDocEdges() {
-      return fromDocEdges;
-    }
-
-    @Override
-    public int[] toDocEdges() {
-      return toDocEdges;
-    }
-
-    int toCount() {
-      return toCount;
+    DocEdges edges() {
+      return edges;
     }
   }
 
@@ -199,7 +190,7 @@ final class AIJoinUtil {
    * bounds. {@code scratch} is a shared from-ord indexed merge buffer, safe to reuse for the next
    * pair.
    */
-  static DocMapping computeDocMapping(
+  static JoinColumnModel computeDocMapping(
       LeafReaderContext fromContext,
       String fromField,
       LeafReaderContext toContext,
@@ -288,11 +279,26 @@ final class AIJoinUtil {
       minToDoc = -1;
       maxToDoc = -1;
     }
-    return new DocMapping(
+    return new JoinColumnModel(
         toDocByFromDoc,
-        toCount,
-        new int[] {minFromDoc, maxFromDoc},
-        new int[] {minToDoc, maxToDoc});
+        new Edges(new int[] {minFromDoc, maxFromDoc}, new int[] {minToDoc, maxToDoc}, toCount));
+  }
+
+  /**
+   * Reads a pair's persisted {@code {min, max}} edges (or {@code toCount}), all stored on doc 0
+   * of the column -- the read-side counterpart of {@link #edgesColumn}.
+   */
+  static int[] loadEdges(LeafReaderContext joinContext, String edgesFieldName) throws IOException {
+    SortedNumericDocValues edgesDV = joinContext.reader().getSortedNumericDocValues(edgesFieldName);
+    assert edgesDV != null : "expected edges column to be present: " + edgesFieldName;
+    int zeroDoc = edgesDV.nextDoc();
+    assert zeroDoc == 0
+        : "expected edges column to be fully materialized, but got doc " + zeroDoc;
+    int[] values = new int[edgesDV.docValueCount()];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = (int) edgesDV.nextValue();
+    }
+    return values;
   }
 
   private static LongColumn edgesColumn(String fromEdgesFieldName, int[] fromDocEdges) {
@@ -336,7 +342,7 @@ final class AIJoinUtil {
    * SORTED_NUMERIC docvalue is the matching to-side doc id. From docs without a match keep -1 in
    * the array and get no value, hence the column is sparse.
    */
-  static Column ordMapBatch(String fieldName, DocMapping mapping) {
+  static Column ordMapBatch(String fieldName, JoinColumnModel mapping) {
     Column column =
         new LongColumn(TO_DOC_VAL_BY_FROM_DOCNUM+fieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
           @Override

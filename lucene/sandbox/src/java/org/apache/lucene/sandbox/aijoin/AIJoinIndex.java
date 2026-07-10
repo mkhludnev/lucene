@@ -20,23 +20,25 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 import org.apache.lucene.document.column.Column;
 import org.apache.lucene.document.column.ColumnBatch;
 import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.NoMergeScheduler;
-import org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocEdges;
-import org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocMapping;
+import org.apache.lucene.sandbox.aijoin.AIJoinUtil.JoinColumnModel;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.SearcherManager;
@@ -75,19 +77,44 @@ public final class AIJoinIndex implements Closeable {
    * pair, others wait on it. Completed futures stay put so a builder that raced a not-yet-visible
    * refresh cannot write a duplicate pair column.
    */
-  private final ConcurrentHashMap<String, CompletableFuture<Map.Entry<String, DocMapping>>> pairBuilds =
+  private final ConcurrentHashMap<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> pairBuilds =
       new ConcurrentHashMap<>();
-
-  /**
-   * One (from-segment, to-segment) pair's ordinal-map column: its field name and the name of the
-   * sidecar segment carrying it, so the column survives join reader refreshes.
-   */
-  record PairColumn(String pairFieldName, String joinSegmentName, int joinSegmentLeafOrd,
-     int[] fromDocEdges, int [] toDocEdges,
-    int toCount) implements DocEdges {}
 
   /** A pair's (from-segment, to-segment) leaf ordinals. */
   record SegmentsTuple(int fromLeafOrd, int toLeafOrd) {}
+
+  /**
+   * A pair column's address in the join index: the pair field name and the sidecar segment (name
+   * plus current leaf ordinal) carrying it -- enough to locate and open the column's real
+   * docvalues, or to check whether a pair already exists before deciding what still needs to be
+   * built. A resolved cell's edges are tracked separately, as a plain {@link
+   * org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocEdges}, since they don't change as this
+   * reference is refreshed.
+   */
+  record JoinSegmentReference(String pairFieldName, String joinSegmentName, int joinSegmentLeafOrd) {}
+
+  /**
+   * Scans {@code joinSearcher}'s leaves for every pair column whose field name satisfies {@code
+   * isNeeded}, returning where each one lives. Used both to seed a fresh {@link
+   * org.apache.lucene.sandbox.aijoin.AIJoinWeight}'s view of already-built pairs, and by {@link
+   * ToLeafJoinContext} to relocate a pair whose cached segment reference no longer resolves.
+   */
+  static Map<String, JoinSegmentReference> extractExistingJoinColumns(
+      IndexSearcher joinSearcher, Predicate<String> isNeeded) {
+    Map<String, JoinSegmentReference> existingJoinSegments =
+        new HashMap<>(joinSearcher.getIndexReader().leaves().size());
+    for (LeafReaderContext joinContext : joinSearcher.getIndexReader().leaves()) {
+      String segmentName = AIJoinUtil.segmentName(joinContext);
+      for (FieldInfo fieldInfo : joinContext.reader().getFieldInfos()) {
+        String splits[] = fieldInfo.name.split(AIJoinUtil.TO_DOC_VAL_BY_FROM_DOCNUM);
+        if (splits.length == 2 && isNeeded.test(splits[1])) {
+          existingJoinSegments.computeIfAbsent(
+              splits[1], fieldName -> new JoinSegmentReference(fieldName, segmentName, joinContext.ord));
+        }
+      }
+    }
+    return existingJoinSegments;
+  }
 
   private AIJoinIndex(Directory directory) throws IOException {
     this.directory = directory;
@@ -139,25 +166,25 @@ public final class AIJoinIndex implements Closeable {
    *
    * @return in memory data for just written segemts
    */
-  Map<String, DocMapping> writeJoinSegments(
+  Map<String, JoinColumnModel> writeJoinSegments(
       Map<String, SegmentsTuple> missingPairs,
       IndexReader fromReader,
       String fromField,
       IndexReader toReader,
       String toField)
       throws IOException {
-    Map<String, CompletableFuture<Map.Entry<String, DocMapping>>> owned = new LinkedHashMap<>();
-    List<CompletableFuture<Map.Entry<String, DocMapping>>> awaited = new ArrayList<>();
+    Map<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> owned = new LinkedHashMap<>();
+    List<CompletableFuture<Map.Entry<String, JoinColumnModel>>> awaited = new ArrayList<>();
     for (String pairFieldName : missingPairs.keySet()) {
-      CompletableFuture<Map.Entry<String, DocMapping>> created = new CompletableFuture<>();
-      CompletableFuture<Map.Entry<String, DocMapping>> existing = pairBuilds.putIfAbsent(pairFieldName, created);
+      CompletableFuture<Map.Entry<String, JoinColumnModel>> created = new CompletableFuture<>();
+      CompletableFuture<Map.Entry<String, JoinColumnModel>> existing = pairBuilds.putIfAbsent(pairFieldName, created);
       if (existing == null) {
         owned.put(pairFieldName, created);
       } else {
         awaited.add(existing);
       }
     }
-    Map<String,DocMapping> loadedMappings = new LinkedHashMap<>();
+    Map<String,JoinColumnModel> loadedMappings = new LinkedHashMap<>();
     try {
       if (!owned.isEmpty()) {
         // all owned pairs go into a single batch: pair columns are addressed by from-side doc id,
@@ -173,7 +200,7 @@ public final class AIJoinIndex implements Closeable {
               new long
                   [Math.toIntExact(
                       DocValues.getSortedSet(fromContext.reader(), fromField).getValueCount())];
-          AIJoinUtil.DocMapping mapping =
+          AIJoinUtil.JoinColumnModel mapping =
               AIJoinUtil.computeDocMapping(fromContext, fromField, toContext, toField, scratch);
           columns.addAll( // what if there's no hits ???!! TODO needs to wite a thumbnail??
               AIJoinUtil.createJoinColumns(mapping, pairFieldName));
@@ -182,7 +209,7 @@ public final class AIJoinIndex implements Closeable {
         }
         writeBatch(batchNumDocs, columns);
         //TODO flush every single field to get single field segments
-        for (Map.Entry<String, CompletableFuture<Map.Entry<String, DocMapping>>> entry :
+        for (Map.Entry<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> entry :
             owned.entrySet()) {
           entry
               .getValue()
@@ -193,17 +220,17 @@ public final class AIJoinIndex implements Closeable {
       }
     } catch (Throwable t) {
       // withdraw the claims so a later query can retry the build
-      for (Map.Entry<String, CompletableFuture<Map.Entry<String, DocMapping>>> entry :
+      for (Map.Entry<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> entry :
           owned.entrySet()) {
         pairBuilds.remove(entry.getKey(), entry.getValue());
         entry.getValue().completeExceptionally(t);
       }
       throw t;
     }
-    Map<String, DocMapping> result = new LinkedHashMap<>(loadedMappings);
-    for (CompletableFuture<Map.Entry<String, DocMapping>> future : awaited) {
+    Map<String, JoinColumnModel> result = new LinkedHashMap<>(loadedMappings);
+    for (CompletableFuture<Map.Entry<String, JoinColumnModel>> future : awaited) {
       try {
-        Map.Entry<String, DocMapping> entry = future.join();
+        Map.Entry<String, JoinColumnModel> entry = future.join();
         result.put(entry.getKey(), entry.getValue());
       } catch (CompletionException e) {
         Throwable cause = e.getCause();

@@ -105,7 +105,7 @@ public class TestAIJoin extends LuceneTestCase {
               childrenDir,
               newIndexWriterConfig(new MockAnalyzer(random()))
                   .setMergePolicy(NoMergePolicy.INSTANCE));
-      int numParents = TestUtil.nextInt(random(), 8, 12);
+      int numParents = atLeast(10);
       int childSeq = 0;
       for (int p = 0; p < numParents; p++) {
         String parentId = "parent" + p;
@@ -233,24 +233,6 @@ public class TestAIJoin extends LuceneTestCase {
     return expected;
   }
 
-  public void testJoinRandomChildrenSubset() throws Exception {
-    try (ParentChildIndices indices = new ParentChildIndices()) {
-      try (IndexReader childrenReader = indices.childrenWriter.getReader();
-          IndexReader parentsReader = indices.parentsWriter.getReader()) {
-        assertTrue("children index should be segmented", childrenReader.leaves().size() > 1);
-        assertTrue("parents index should be segmented", parentsReader.leaves().size() > 1);
-
-        Set<String> selectedChildren = randomChildrenSubset(indices);
-        assertEquals(
-            expectedParents(indices, selectedChildren),
-            searchParentIdsBothJoins(
-                newSearcher(parentsReader),
-                anyOfChildren(selectedChildren),
-                newSearcher(childrenReader)));
-      }
-    }
-  }
-
   public void testAIJoinRandomChildrenSubset() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
       try (IndexReader childrenReader = indices.childrenWriter.getReader();
@@ -302,70 +284,88 @@ public class TestAIJoin extends LuceneTestCase {
 
   public void testUpdateChildParentIdFK() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
-      String childId = RandomPicks.randomFrom(random(), indices.parentIdByChildId.keySet());
-      String oldParentId = indices.parentIdByChildId.get(childId);
-      String newParentId;
-      do {
-        newParentId = RandomPicks.randomFrom(random(), indices.colorByParentId.keySet());
-      } while (newParentId.equals(oldParentId));
+      // repeated re-pointing exercises the sidecar join index's update path many times over,
+      // not just a single one-off update
+      for (int iter = 0; iter < atLeast(5); iter++) {
+        String childId = RandomPicks.randomFrom(random(), indices.parentIdByChildId.keySet());
+        String oldParentId = indices.parentIdByChildId.get(childId);
+        String newParentId;
+        do {
+          newParentId = RandomPicks.randomFrom(random(), indices.colorByParentId.keySet());
+        } while (newParentId.equals(oldParentId));
 
-      // SortedSetDocValues can't be updated in place, so replace the whole child document
-      indices.childrenWriter.updateDocument(new Term(ID, childId), childDoc(childId, newParentId));
-      indices.parentIdByChildId.put(childId, newParentId);
+        // SortedSetDocValues can't be updated in place, so replace the whole child document
+        indices.childrenWriter.updateDocument(
+            new Term(ID, childId), childDoc(childId, newParentId));
+        indices.parentIdByChildId.put(childId, newParentId);
 
-      try (IndexReader childrenReader = indices.childrenWriter.getReader();
-          IndexReader parentsReader = indices.parentsWriter.getReader()) {
-        IndexSearcher childrenSearcher = newSearcher(childrenReader);
-        IndexSearcher parentsSearcher = newSearcher(parentsReader);
+        try (IndexReader childrenReader = indices.childrenWriter.getReader();
+            IndexReader parentsReader = indices.parentsWriter.getReader()) {
+          IndexSearcher childrenSearcher = newSearcher(childrenReader);
+          IndexSearcher parentsSearcher = newSearcher(parentsReader);
 
-        assertEquals(
-            Set.of(newParentId),
-            searchParentIdsBothJoins(
-                parentsSearcher, new TermQuery(new Term(ID, childId)), childrenSearcher));
+          assertEquals(
+              Set.of(newParentId),
+              searchParentIdsBothJoins(
+                  parentsSearcher, new TermQuery(new Term(ID, childId)), childrenSearcher));
 
-        // the old parent is still reachable through its remaining children
-        assertEquals(
-            Set.of(oldParentId),
-            searchParentIdsBothJoins(
-                parentsSearcher,
-                new TermQuery(new Term(PARENT_ID_FK, oldParentId)),
-                childrenSearcher));
+          // the old parent is reachable only while it still has other children pointing at it
+          Set<String> expectedOldParent =
+              indices.childrenOf(oldParentId).isEmpty() ? Set.of() : Set.of(oldParentId);
+          assertEquals(
+              expectedOldParent,
+              searchParentIdsBothJoins(
+                  parentsSearcher,
+                  new TermQuery(new Term(PARENT_ID_FK, oldParentId)),
+                  childrenSearcher));
+        }
       }
     }
   }
 
   public void testUpdateParentId() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
-      String parentId = RandomPicks.randomFrom(random(), indices.colorByParentId.keySet());
-      String renamedParentId = parentId + "-renamed";
-      indices.parentsWriter.updateDocument(
-          new Term(PARENT_ID, parentId),
-          parentDoc(renamedParentId, indices.colorByParentId.get(parentId)));
+      // repeated renaming exercises the sidecar join index's update path many times over, not
+      // just a single one-off rename
+      for (int iter = 0; iter < atLeast(5); iter++) {
+        String parentId = RandomPicks.randomFrom(random(), indices.colorByParentId.keySet());
+        String renamedParentId = parentId + "-renamed" + iter;
+        String color = indices.colorByParentId.remove(parentId);
+        indices.parentsWriter.updateDocument(
+            new Term(PARENT_ID, parentId), parentDoc(renamedParentId, color));
+        indices.colorByParentId.put(renamedParentId, color);
 
-      try (IndexReader childrenReader = indices.childrenWriter.getReader();
-          IndexReader parentsReader = indices.parentsWriter.getReader()) {
-        // children still point at the old id, so they join to nothing
-        assertEquals(
-            Set.of(),
-            searchParentIdsBothJoins(
-                newSearcher(parentsReader),
-                new TermQuery(new Term(PARENT_ID_FK, parentId)),
-                newSearcher(childrenReader)));
-      }
+        try (IndexReader childrenReader = indices.childrenWriter.getReader();
+            IndexReader parentsReader = indices.parentsWriter.getReader()) {
+          // children still point at the old id, so they join to nothing
+          assertEquals(
+              Set.of(),
+              searchParentIdsBothJoins(
+                  newSearcher(parentsReader),
+                  new TermQuery(new Term(PARENT_ID_FK, parentId)),
+                  newSearcher(childrenReader)));
+        }
 
-      // re-point one child at the renamed parent and the join works again
-      String childId = RandomPicks.randomFrom(random(), indices.childrenOf(parentId));
-      indices.childrenWriter.updateDocument(
-          new Term(ID, childId), childDoc(childId, renamedParentId));
+        // re-point one child at the renamed parent and the join works again, if any of this
+        // parent's children haven't already been re-pointed elsewhere by an earlier iteration
+        List<String> children = indices.childrenOf(parentId);
+        if (children.isEmpty()) {
+          continue;
+        }
+        String childId = RandomPicks.randomFrom(random(), children);
+        indices.childrenWriter.updateDocument(
+            new Term(ID, childId), childDoc(childId, renamedParentId));
+        indices.parentIdByChildId.put(childId, renamedParentId);
 
-      try (IndexReader childrenReader = indices.childrenWriter.getReader();
-          IndexReader parentsReader = indices.parentsWriter.getReader()) {
-        assertEquals(
-            Set.of(renamedParentId),
-            searchParentIdsBothJoins(
-                newSearcher(parentsReader),
-                new TermQuery(new Term(ID, childId)),
-                newSearcher(childrenReader)));
+        try (IndexReader childrenReader = indices.childrenWriter.getReader();
+            IndexReader parentsReader = indices.parentsWriter.getReader()) {
+          assertEquals(
+              Set.of(renamedParentId),
+              searchParentIdsBothJoins(
+                  newSearcher(parentsReader),
+                  new TermQuery(new Term(ID, childId)),
+                  newSearcher(childrenReader)));
+        }
       }
     }
   }

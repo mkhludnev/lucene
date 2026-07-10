@@ -17,28 +17,18 @@
 package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.IntFunction;
 import java.util.function.Predicate;
 
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.FilteredDocIdSetIterator;
+import org.apache.lucene.sandbox.aijoin.AIJoinIndex.JoinSegmentReference;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LRUQueryCache;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryCachingPolicy;
 import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.ScoreMode;
-import org.apache.lucene.search.Scorer;
-import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
-import org.apache.lucene.util.BitSet;
-import org.apache.lucene.util.Bits;
 
 /**
  * Joins the from-side index to the to-side index this query is executed against, resolving
@@ -57,8 +47,6 @@ class AIJoinQuery extends Query {
   private final IndexSearcher fromSearcher;
   final String toField;
   IndexSearcher cachedFromSearcher;
-
-  record JoinSegmentReference(String pairFieldName, String joinSegmentName, int joinSegmentLeafOrd) {}
 
   AIJoinQuery(
       AIJoinIndex joinIndex,
@@ -105,30 +93,13 @@ class AIJoinQuery extends Query {
     Predicate<String> isNeeded = fn -> true;
 
     try {
-      existingJoinSegments = extractExistingJoinColumns(joinSearcher, isNeeded);
+      existingJoinSegments = AIJoinIndex.extractExistingJoinColumns(joinSearcher, isNeeded);
     } finally {
       this.joinIndex.release(joinSearcher);
     }
 
     return new AIJoinWeight(
         this, joinSearcher, existingJoinSegments, searcher.getIndexReader(), scoreMode, boost);
-  }
-
-  /*** TODO move to util or index */
-  static Map<String, JoinSegmentReference> extractExistingJoinColumns(IndexSearcher joinSearcher, Predicate<String> isNeeded) {
-    Map<String, JoinSegmentReference> existingJoinSegments;
-    existingJoinSegments = new HashMap<>(joinSearcher.getIndexReader().leaves().size());
-    for (LeafReaderContext joinContext : joinSearcher.getIndexReader().leaves()) {
-      String segmentName = AIJoinUtil.segmentName(joinContext);
-      for (FieldInfo fieldInfo : joinContext.reader().getFieldInfos()) {
-        String splits[] = fieldInfo.name.split(AIJoinUtil.TO_DOC_VAL_BY_FROM_DOCNUM);
-        if (splits.length == 2 && isNeeded.test(splits[1])) {
-            existingJoinSegments.computeIfAbsent(splits[1],
-              fieldName ->  new JoinSegmentReference(fieldName, segmentName, joinContext.ord));
-        }
-      }
-    }
-    return existingJoinSegments;
   }
 
   @Override
