@@ -4,7 +4,7 @@ import java.io.IOException;
 import java.util.Map;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.sandbox.aijoin.AIJoinQuery.JoinSegment;
+import org.apache.lucene.sandbox.aijoin.AIJoinQuery.JoinSegmentReference;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.ScoreMode;
@@ -15,7 +15,7 @@ import org.apache.lucene.search.Weight;
 
 final class AIJoinWeight extends Weight {
   final IndexSearcher maybeStaleJoinSearcher;
-  final Map<String, JoinSegment> existingJoinSegments;
+  final Map<String, JoinSegmentReference> existingJoinSegments;
   private final ScoreMode scoreMode;
   private final float boost;
   private final IndexReader toReader;
@@ -32,7 +32,7 @@ final class AIJoinWeight extends Weight {
 
   AIJoinWeight(AIJoinQuery aiJoinQuery,
     IndexSearcher maybeStaleJoinSearcher,
-    Map<String, JoinSegment> existingJoinSegments,
+    Map<String, JoinSegmentReference> existingJoinSegments,
       IndexReader toReader,
       ScoreMode scoreMode,
       float boost)

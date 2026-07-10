@@ -35,6 +35,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.NoMergeScheduler;
+import org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocEdges;
 import org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocMapping;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
@@ -82,7 +83,7 @@ public final class AIJoinIndex implements Closeable {
    * sidecar segment carrying it, so the column survives join reader refreshes.
    */
   record PairColumn(String pairFieldName, String joinSegmentName, int[] fromDocEdges, int [] toDocEdges,
-    int toCount) {}
+    int toCount) implements DocEdges {}
 
   /** A pair's (from-segment, to-segment) leaf ordinals. */
   record SegmentsTuple(int fromLeafOrd, int toLeafOrd) {}

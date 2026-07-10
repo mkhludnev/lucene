@@ -58,7 +58,7 @@ class AIJoinQuery extends Query {
   final String toField;
   IndexSearcher cachedFromSearcher;
 
-  record JoinSegment(String pairFieldName, String joinSegmentName, int joinSegmentLeafOrd) {}
+  record JoinSegmentReference(String pairFieldName, String joinSegmentName, int joinSegmentLeafOrd) {}
 
   AIJoinQuery(
       AIJoinIndex joinIndex,
@@ -99,36 +99,8 @@ class AIJoinQuery extends Query {
   @Override
   public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost)
       throws IOException {
-    // run the from-side selection once per weight and cache its matches as one bitset per from
-    // segment; from segments without matches keep null
-    IndexReader fromReader = fromSearcher.getIndexReader();
-    Weight fromWeight = fromSearcher.createWeight(fromQuery, ScoreMode.COMPLETE_NO_SCORES, 1f);
-    BitSet[] fromMatchesByOrd = new BitSet[fromReader.leaves().size()];
-    for (LeafReaderContext fromContext : fromReader.leaves()) {
-      ScorerSupplier supplier = fromWeight.scorerSupplier(fromContext);
-      if (supplier != null) {
-        Scorer scorer = supplier.get(Long.MAX_VALUE);
-        DocIdSetIterator iterator = scorer.iterator();
-        Bits liveDocs = fromContext.reader().getLiveDocs();
-        if (liveDocs != null) {
-          // scorers don't filter deletions themselves: that's collection-time acceptDocs work,
-          // which this cached-bitset path bypasses
-          iterator =
-              new FilteredDocIdSetIterator(iterator) {
-                @Override
-                protected boolean match(int doc) {
-                  return liveDocs.get(doc);
-                }
-              };
-        }
-        fromMatchesByOrd[fromContext.ord] = BitSet.of(iterator, fromContext.reader().maxDoc());
-      }
-    }
-    // from segments without cached matches resolve to null rather than an out-of-range index
-    IntFunction<BitSet> fromMatches = ord -> fromMatchesByOrd[ord];
-
     // check exising join segemtent this hash will be across all to-segments scorers
-    Map<String,JoinSegment> existingJoinSegments;
+    Map<String,JoinSegmentReference> existingJoinSegments;
     IndexSearcher joinSearcher = this.joinIndex.acquire();
     Predicate<String> isNeeded = fn -> true;
 
@@ -143,8 +115,8 @@ class AIJoinQuery extends Query {
   }
 
   /*** TODO move to util or index */
-  static Map<String, JoinSegment> extractExistingJoinColumns(IndexSearcher joinSearcher, Predicate<String> isNeeded) {
-    Map<String, JoinSegment> existingJoinSegments;
+  static Map<String, JoinSegmentReference> extractExistingJoinColumns(IndexSearcher joinSearcher, Predicate<String> isNeeded) {
+    Map<String, JoinSegmentReference> existingJoinSegments;
     existingJoinSegments = new HashMap<>(joinSearcher.getIndexReader().leaves().size());
     for (LeafReaderContext joinContext : joinSearcher.getIndexReader().leaves()) {
       String segmentName = AIJoinUtil.segmentName(joinContext);
@@ -152,7 +124,7 @@ class AIJoinQuery extends Query {
         String splits[] = fieldInfo.name.split(AIJoinUtil.TO_DOC_VAL_BY_FROM_DOCNUM);
         if (splits.length == 2 && isNeeded.test(splits[1])) {
             existingJoinSegments.computeIfAbsent(splits[1],
-              fieldName ->  new JoinSegment(fieldName, segmentName, joinContext.ord));
+              fieldName ->  new JoinSegmentReference(fieldName, segmentName, joinContext.ord));
         }
       }
     }

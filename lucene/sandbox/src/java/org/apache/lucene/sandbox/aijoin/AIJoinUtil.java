@@ -89,13 +89,24 @@ final class AIJoinUtil {
   }
 
   /**
+   * A pair's {min, max} from-doc and to-doc bounds, common to both a pair freshly built on demand
+   * ({@link DocMapping}) and one already persisted in the join index ({@link
+   * AIJoinIndex.PairColumn}), so code walking matches doesn't need to care which one backs it.
+   */
+  interface DocEdges {
+    int[] fromDocEdges();
+
+    int[] toDocEdges();
+  }
+
+  /**
    * Doc-id bounds and the from-doc-to-to-doc map produced by {@link #computeDocMapping}:
    * {@code fromDocEdges} and {@code toDocEdges} are each a pair's {min, max} doc bounds.
    * {@link #toDocByFromDoc()} mirrors the on-disk column's read API, so freshly built pairs (not
    * yet flushed to the join index) and pairs loaded from the join index can be walked by the same
    * code.
    */
-  static final class DocMapping {
+  static final class DocMapping implements DocEdges {
     private final int[] toDocByFromDoc;
     private final int[] fromDocEdges;
     private final int[] toDocEdges;
@@ -113,11 +124,13 @@ final class AIJoinUtil {
       return new ArrayBackedSortedNumericDocValues(toDocByFromDoc);
     }
 
-    int[] fromDocEdges() {
+    @Override
+    public int[] fromDocEdges() {
       return fromDocEdges;
     }
 
-    int[] toDocEdges() {
+    @Override
+    public int[] toDocEdges() {
       return toDocEdges;
     }
 
