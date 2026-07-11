@@ -17,10 +17,13 @@
 package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Predicate;
 
+import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.sandbox.aijoin.AIJoinIndex.JoinSegmentReference;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LRUQueryCache;
@@ -87,11 +90,27 @@ class AIJoinQuery extends Query {
   @Override
   public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost)
       throws IOException {
-    // check exising join segemtent this hash will be across all to-segments scorers
+    // narrow the join index lookup to pairs this weight could possibly need: from-segments with
+    // at least one live match for fromQuery (mirrors the per-to-segment filtering in
+    // ToLeafJoinContext#createFromItersTasks, without needing a to-segment to preposition
+    // against), crossed with every to-segment of the searcher this weight is created against --
+    // this hash will be shared across all to-segments' scorers
+    Set<String> matchingFromKeys =
+        AIJoinUtil.matchingFromSideKeys(cachedFromSearcher, fromQuery, fromField);
+    Set<String> neededPairs = new HashSet<>();
+    for (LeafReaderContext toContext : searcher.getIndexReader().leaves()) {
+      String toKey = AIJoinUtil.getSideKey(toContext, toField);
+      for (String fromKey : matchingFromKeys) {
+        neededPairs.add(fromKey + "_" + toKey);
+      }
+    }
+
+    joinIndex.onCreateWeight(neededPairs, fromSearcher, searcher );//ignoring fields
+
+    Predicate<String> isNeeded = neededPairs::contains;
+
     Map<String,JoinSegmentReference> existingJoinSegments;
     IndexSearcher joinSearcher = this.joinIndex.acquire();
-    Predicate<String> isNeeded = fn -> true;
-
     try {
       existingJoinSegments = AIJoinIndex.extractExistingJoinColumns(joinSearcher, isNeeded);
     } finally {

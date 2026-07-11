@@ -24,20 +24,21 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.Predicate;
 import org.apache.lucene.document.column.Column;
 import org.apache.lucene.document.column.ColumnBatch;
+import org.apache.lucene.index.ConcurrentMergeScheduler;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.index.NoMergePolicy;
-import org.apache.lucene.index.NoMergeScheduler;
 import org.apache.lucene.sandbox.aijoin.AIJoinUtil.JoinColumnModel;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
@@ -79,6 +80,29 @@ public final class AIJoinIndex implements Closeable {
    */
   private final ConcurrentHashMap<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> pairBuilds =
       new ConcurrentHashMap<>();
+  // package-private (not private): tests reach in directly to observe the reaper's state
+  AIJoinMergePolicy mergePolicy;
+  private ConcurrentMergeScheduler mergeScheduler;
+
+  /** Puts {@code key} -> {@code value}, evicting the oldest key(s) once {@code map} exceeds {@code
+   * maxSize}. Approximate under races (an eviction can drop a key concurrently re-inserted, or the
+   * map can briefly exceed {@code maxSize}) -- acceptable since callers only use this as a soft
+   * cap on a best-effort cache. */
+  static <K, V> V putBounded(
+      ConcurrentHashMap<K, V> map, ConcurrentLinkedQueue<K> insertionOrder, K key, V value, int maxSize) {
+    V previous = map.put(key, value);
+    if (previous == null) {
+      insertionOrder.add(key);
+      while (map.size() > maxSize) {
+        K oldest = insertionOrder.poll();
+        if (oldest == null) {
+          break;
+        }
+        map.remove(oldest);
+      }
+    }
+    return previous;
+  }
 
   /** A pair's (from-segment, to-segment) leaf ordinals. */
   record SegmentsTuple(int fromLeafOrd, int toLeafOrd) {}
@@ -122,8 +146,8 @@ public final class AIJoinIndex implements Closeable {
         new IndexWriter(
             directory,
             new IndexWriterConfig()
-                .setMergePolicy(NoMergePolicy.INSTANCE)
-                .setMergeScheduler(NoMergeScheduler.INSTANCE));
+                .setMergePolicy(this.mergePolicy = new AIJoinMergePolicy())
+                .setMergeScheduler(this.mergeScheduler = new ConcurrentMergeScheduler()));
     this.manager = new SearcherManager(writer, null);
   }
 
@@ -271,5 +295,15 @@ public final class AIJoinIndex implements Closeable {
   @Override
   public void close() throws IOException {
     IOUtils.close(manager, writer, directory);
+  }
+
+  public void onCreateWeight(Set<String> neededPairs, IndexSearcher fromSearcher, IndexSearcher searcher)
+      throws IOException {
+    this.mergePolicy.onCreateWeight(neededPairs, fromSearcher, searcher);
+  }
+
+  /** Test-only: blocks until any in-flight merges (e.g. a dead-pair reap) finish. */
+  void waitForMerges() {
+    mergeScheduler.sync();
   }
 }

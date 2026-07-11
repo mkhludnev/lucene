@@ -26,19 +26,38 @@ import org.apache.lucene.document.column.Column;
 import org.apache.lucene.document.column.LongColumn;
 import org.apache.lucene.document.column.LongColumn.NumericKind;
 import org.apache.lucene.document.column.LongTupleCursor;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.FieldInfosFormat;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesType;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.FilterCodecReader;
 import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ParallelLeafReader;
+import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentReader;
+import java.util.HashSet;
+import java.util.Set;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.FilteredDocIdSetIterator;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.ScorerSupplier;
+import org.apache.lucene.search.Weight;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FilterDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.StringHelper;
 
@@ -189,6 +208,11 @@ final class AIJoinUtil {
    * from-side doc to its matching to-side doc id, along with the pair's from-doc and to-doc
    * bounds. {@code scratch} is a shared from-ord indexed merge buffer, safe to reuse for the next
    * pair.
+   *
+   * <p>Docs already deleted at build time are skipped, purely to avoid persisting entries nobody
+   * can ever match -- deletes are otherwise re-checked live at query time (from-side in {@code
+   * ToLeafJoinContext}, to-side by the searcher's own {@code acceptDocs}), since a pair's cached
+   * mapping outlives whatever gets deleted after it was built.
    */
   static JoinColumnModel computeDocMapping(
       LeafReaderContext fromContext,
@@ -196,9 +220,11 @@ final class AIJoinUtil {
       LeafReaderContext toContext,
       String toField,
       long[] scratch)
-      throws IOException {// TODO apply livedocs
+      throws IOException {
     SortedSetDocValues fromDV = DocValues.getSortedSet(fromContext.reader(), fromField);
     SortedSetDocValues toDV = DocValues.getSortedSet(toContext.reader(), toField);
+    Bits fromLiveDocs = fromContext.reader().getLiveDocs();
+    Bits toLiveDocs = toContext.reader().getLiveDocs();
     // map from-segment ords to to-segment ords by merging the two sorted term dictionaries
     long[] toOrdByFromOrd = scratch;
     Arrays.fill(toOrdByFromOrd, -1L);
@@ -233,6 +259,9 @@ final class AIJoinUtil {
     for (int toDoc = toDV.nextDoc();
         toDoc != DocIdSetIterator.NO_MORE_DOCS;
         toDoc = toDV.nextDoc()) {
+      if (toLiveDocs != null && !toLiveDocs.get(toDoc)) {
+        continue;
+      }
       for (int i = 0; i < toDV.docValueCount(); i++) {
         long toOrd = toDV.nextOrd();
         toDocByToOrd[(int) toOrd] = toDoc;
@@ -251,6 +280,9 @@ final class AIJoinUtil {
     for (int fromDoc = fromDV.nextDoc();
         fromDoc != DocIdSetIterator.NO_MORE_DOCS;
         fromDoc = fromDV.nextDoc()) {
+      if (fromLiveDocs != null && !fromLiveDocs.get(fromDoc)) {
+        continue;
+      }
       for (int i = 0; i < fromDV.docValueCount(); i++) {
         long fromOrd = fromDV.nextOrd();
         int toOrd = (int) toOrdByFromOrd[(int) fromOrd];
@@ -282,6 +314,63 @@ final class AIJoinUtil {
     return new JoinColumnModel(
         toDocByFromDoc,
         new Edges(new int[] {minFromDoc, maxFromDoc}, new int[] {minToDoc, maxToDoc}, toCount));
+  }
+
+  /**
+   * A from-segment's matches against the cached from-side weight: {@link #iterator()} is a fresh,
+   * live-doc-filtered {@link DocIdSetIterator} positioned before doc 0, and {@link #cost()} is the
+   * underlying {@link ScorerSupplier}'s cost, captured before the iterator was created.
+   */
+  record MatchingFromDocs(DocIdSetIterator iterator, long cost) {}
+
+  /**
+   * Resolves {@code fromContext} against {@code cachedFromWeight}, filtering out deleted docs, or
+   * returns {@code null} if the segment has no live match at all. Shared by {@link
+   * ToLeafJoinContext#createFromItersTasks}, which walks the returned iterator once per
+   * to-segment, and by {@link AIJoinQuery#createWeight}, which only needs to know whether the
+   * segment matches anything.
+   */
+  static MatchingFromDocs matchingFromDocs(Weight cachedFromWeight, LeafReaderContext fromContext)
+      throws IOException {
+    ScorerSupplier fromSupplier = cachedFromWeight.scorerSupplier(fromContext);
+    if (fromSupplier == null) {
+      return null;
+    }
+    long fromMatchCost = fromSupplier.cost();
+    Scorer fromScorer = fromSupplier.get(Long.MAX_VALUE);
+    DocIdSetIterator matchedFromDocs = fromScorer.iterator();
+    Bits liveDocs = fromContext.reader().getLiveDocs();
+    if (liveDocs != null) {
+      // the cached weight's scorer doesn't filter deletions itself, and a from doc deleted
+      // since the pair columns were built (e.g. by an update) must not resolve to a match
+      matchedFromDocs =
+          new FilteredDocIdSetIterator(matchedFromDocs) {
+            @Override
+            protected boolean match(int doc) {
+              return liveDocs.get(doc);
+            }
+          };
+    }
+    return new MatchingFromDocs(matchedFromDocs, fromMatchCost);
+  }
+
+  /**
+   * The from-side keys ({@link #getSideKey}) of every from-segment with at least one live doc
+   * matching {@code fromQuery} -- i.e. every from-segment that could possibly contribute a pair to
+   * any to-segment. Used at {@link AIJoinQuery#createWeight} time to narrow which pair columns are
+   * worth looking up in the join index, without yet knowing the to-side searcher's leaves.
+   */
+  static Set<String> matchingFromSideKeys(
+      IndexSearcher cachedFromSearcher, Query fromQuery, String fromField) throws IOException {
+    Weight fromWeight = cachedFromSearcher.createWeight(fromQuery, ScoreMode.COMPLETE_NO_SCORES, 1);
+    Set<String> keys = new HashSet<>();
+    for (LeafReaderContext fromContext : cachedFromSearcher.getLeafContexts()) {
+      MatchingFromDocs matching = matchingFromDocs(fromWeight, fromContext);
+      if (matching != null && matching.iterator().nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+        keys.add(getSideKey(fromContext, fromField));
+      }
+    }
+    return keys;
   }
 
   /**
@@ -431,5 +520,45 @@ final class AIJoinUtil {
   /** The name of the sidecar segment carrying the given join index leaf. */
   static String segmentName(LeafReaderContext joinContext) {
     return segmentReader(joinContext.reader()).getSegmentName();
+  }
+
+  /** A hashable key identifying the storage location behind {@code directory}, stable across
+   * separate opens of the same path so repeated calls resolve to the same cache entry. */
+  static Object directoryKey(Directory directory) throws IOException {
+    Directory unwrapped = FilterDirectory.unwrap(directory);
+    if (unwrapped instanceof FSDirectory fsDir) {
+      return fsDir.getDirectory().toRealPath(); // Path has proper equals/hashCode
+    }
+    return unwrapped; // RAMDirectory/ByteBuffersDirectory etc: identity is the real key
+  }
+
+  /** Every pair field name (the part after {@link #TO_DOC_VAL_BY_FROM_DOCNUM}) present in {@code
+   * fieldInfos}, i.e. every join pair this segment carries, needed or not. */
+  static Set<String> pairFieldNames(FieldInfos fieldInfos) {
+    Set<String> names = new HashSet<>();
+    for (FieldInfo fieldInfo : fieldInfos) {
+      String[] splits = fieldInfo.name.split(TO_DOC_VAL_BY_FROM_DOCNUM);
+      if (splits.length == 2) {
+        names.add(splits[1]);
+      }
+    }
+    return names;
+  }
+
+  /** Reads a segment's {@link FieldInfos} straight off disk, without opening a full reader.
+   * Mirrors {@code IndexWriter#readFieldInfos}, which isn't visible outside its package. */
+  static FieldInfos readFieldInfos(SegmentCommitInfo info) throws IOException {
+    Codec codec = info.info.getCodec();
+    FieldInfosFormat fieldInfosFormat = codec.fieldInfosFormat();
+    if (info.hasFieldUpdates()) {
+      String segmentSuffix = Long.toString(info.getFieldInfosGen(), Character.MAX_RADIX);
+      return fieldInfosFormat.read(info.info.dir, info.info, segmentSuffix, IOContext.READONCE);
+    } else if (info.info.getUseCompoundFile()) {
+      try (Directory cfs = codec.compoundFormat().getCompoundReader(info.info.dir, info.info)) {
+        return fieldInfosFormat.read(cfs, info.info, "", IOContext.READONCE);
+      }
+    } else {
+      return fieldInfosFormat.read(info.info.dir, info.info, "", IOContext.READONCE);
+    }
   }
 }

@@ -17,7 +17,6 @@ import java.util.Map.Entry;
 import java.util.Set;
 
 import org.apache.lucene.util.BitSetIterator;
-import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 
 import java.util.concurrent.ThreadLocalRandom;
@@ -31,7 +30,6 @@ import org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocEdges;
 import org.apache.lucene.sandbox.aijoin.AIJoinUtil.JoinColumnModel;
 import org.apache.lucene.search.ConstantScoreScorer;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.FilteredDocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
@@ -57,7 +55,7 @@ class ToLeafJoinContext {
   private int firstToDoc = DocIdSetIterator.NO_MORE_DOCS;
   private int lastToDoc = -1;
   private long matchedToDocsCount=0;
-  private FixedBitSet toApproximation=null;
+  private FixedBitSet falsePositiveToDocsBits=null;
   /** ordered by from-cost descending */
   private final List<JoinTask> joinCells = new ArrayList<>();
   // secondary indices over joinCells, kept in sync by addJoinTask/removeJoinCell: every cell is
@@ -66,6 +64,105 @@ class ToLeafJoinContext {
   private final JoinTask[] joinCellsByFromSegOrd;
   private final Map<String, JoinTask> joinCellsByPairFieldName = new HashMap<>();
   private IndexReader toReader;
+
+  // TODO kept alongside LazyRefineTwoPhIter for comparison/rollback; not currently wired up
+  private final class EagerRefineTwoPhIter extends TwoPhaseIterator {
+    boolean pruned = false;
+
+    private EagerRefineTwoPhIter(DocIdSetIterator approximation) {
+      super(approximation);
+    }
+
+    @Override
+    public boolean matches() throws IOException {
+      if (!pruned) {
+        FixedBitSet matchedToDocs;
+        int shift;
+        // prune the approximation to the resolved matches: drop the
+        // remaining range bits and or the matches back in at their
+        // absolute positions, so the approximation stops visiting
+        // non-matching docs
+        shift = approximation.docID();
+        // TODO the this is: it's enough to just confirm the match the return the control.
+        // TODO there, should be a refined bitset
+        // TODO when we need to refine an approx, we go throug join segments,
+        // TODO and drop them into refined bitset until we confirm the match
+        // TODO the order of iteration is: to side doc freq, which we neeed to persist and read then
+        // TODO once we drop a join segment to refined bitset we exclude it from iterations
+        // TODO also, just boundary check the following matches checks
+        // TODO the following matches() checks, at first confirm with refied bitset,
+        // TODO if it's false procede with to bitset dumping into refined bitset
+        matchedToDocs = refineToMatches( shift);
+        falsePositiveToDocsBits.clear(shift, lastToDoc + 1);
+        FixedBitSet.orRange(matchedToDocs, 0, falsePositiveToDocsBits, shift, lastToDoc - shift + 1);
+        pruned = true;
+        return falsePositiveToDocsBits.get(approximation.docID());
+      }
+      // the bitset spans [shift, lastToDoc] shifted to zero
+      // return matchedToDocs.get(approximation.docID() - shift);
+      assert /*return*/ falsePositiveToDocsBits.get(approximation.docID()); // always true ??
+      return true;
+    }
+
+    @Override
+    public float matchCost() {
+      return matchedToDocsCount;
+    }
+  }
+
+  private final class LazyRefineTwoPhIter extends TwoPhaseIterator {
+    FixedBitSet falseNegToDocsBits = null;
+    private int shift;
+
+    private LazyRefineTwoPhIter(DocIdSetIterator approximation) {
+      super(approximation);
+    }
+
+    @Override
+    public boolean matches() throws IOException {
+      if (joinCells.isEmpty()) {
+        assert falsePositiveToDocsBits.get(approximation.docID());
+        return true; /// aprox is a true pos already
+      }
+      if (falseNegToDocsBits!=null){
+        if(falseNegToDocsBits.get(approximation.docID()-shift)){
+          return true;
+        }// otherwise we don't know if 0 is real false
+      }
+
+      IndexSearcher freshSearcher = ToLeafJoinContext.this.joinIndex.acquire();
+      try {
+        refreshJoinTasksReferences(freshSearcher);
+        assert ToLeafJoinContext.this.lastSeenJoinSearcher == freshSearcher;
+        for (JoinTask cell : new ArrayList<>(joinCells)) {
+          if (falseNegToDocsBits==null){
+            this.shift = approximation.docID();
+            falseNegToDocsBits = new FixedBitSet(lastToDoc+1-shift);
+          }
+          cell.dumpMatchesInto(falseNegToDocsBits, shift);
+          ToLeafJoinContext.this.removeJoinCell(cell);
+          if (!joinCells.isEmpty()){
+            if(falseNegToDocsBits.get(approximation.docID()-shift)){
+              return true;
+            }// otherwise we don't know if 0 is real false
+          }
+        }
+      } finally {
+        ToLeafJoinContext.this.joinIndex.release(freshSearcher);
+      }
+      // drop all to masks, got no hit - it means it's a true negative now.
+
+      falsePositiveToDocsBits.clear(shift, lastToDoc + 1);
+      FixedBitSet.orRange(falseNegToDocsBits, 0, falsePositiveToDocsBits, shift, lastToDoc - shift + 1);
+
+      return falsePositiveToDocsBits.get(approximation.docID());
+    }
+
+    @Override
+    public float matchCost() {
+      return matchedToDocsCount;
+    }
+  }
 
   /**
    * Represents a cell in the join matrix bounded to from and to segments. Resolved exactly once,
@@ -269,10 +366,10 @@ class ToLeafJoinContext {
       firstToDoc = Math.min(firstToDoc, docEdges.toDocEdges()[0]);
       lastToDoc = Math.max(lastToDoc, docEdges.toDocEdges()[1]);
       matchedToDocsCount += docEdges.toDocEdges()[1] - docEdges.toDocEdges()[0] + 1;
-      if (toApproximation == null) {
-        toApproximation = new FixedBitSet(toContext.reader().maxDoc());
+      if (falsePositiveToDocsBits == null) {
+        falsePositiveToDocsBits = new FixedBitSet(toContext.reader().maxDoc());
       }
-      toApproximation.set(docEdges.toDocEdges()[0], docEdges.toDocEdges()[1] + 1);
+      falsePositiveToDocsBits.set(docEdges.toDocEdges()[0], docEdges.toDocEdges()[1] + 1);
     }
   }
 
@@ -442,26 +539,11 @@ class ToLeafJoinContext {
     Map<JoinTask, Long> fromMatchCostByTask = new IdentityHashMap<>();
     for (LeafReaderContext fromContext :
             leaves) {
-      //
-      ScorerSupplier fromSupplier = cachedFromWeight.scorerSupplier(fromContext);
-      if (fromSupplier == null) {
+      AIJoinUtil.MatchingFromDocs matching = AIJoinUtil.matchingFromDocs(cachedFromWeight, fromContext);
+      if (matching == null) {
         continue; // no from-side matches in this segment
       }
-      long fromMatchCost = fromSupplier.cost();
-      Scorer fromScorer = fromSupplier.get(Long.MAX_VALUE);
-      DocIdSetIterator matchedFromDocs = fromScorer.iterator();
-      Bits liveDocs = fromContext.reader().getLiveDocs();
-      if (liveDocs != null) {
-        // the cached weight's scorer doesn't filter deletions itself, and a from doc deleted
-        // since the pair columns were built (e.g. by an update) must not resolve to a match
-        matchedFromDocs =
-            new FilteredDocIdSetIterator(matchedFromDocs) {
-              @Override
-              protected boolean match(int doc) {
-                return liveDocs.get(doc);
-              }
-            };
-      }
+      DocIdSetIterator matchedFromDocs = matching.iterator();
       if (matchedFromDocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
         // name every contributing (from, to) pair column; pair field names are unique across pairs
         String pairFieldName =
@@ -470,7 +552,7 @@ class ToLeafJoinContext {
           new SegmentsTuple(fromContext.ord, toContext.ord),
            matchedFromDocs);
         tasks.add(task);
-        fromMatchCostByTask.put(task, fromMatchCost);
+        fromMatchCostByTask.put(task, matching.cost());
       }
     }
     // process the from segments with the most matches first
@@ -479,56 +561,18 @@ class ToLeafJoinContext {
   }
 
   public ScorerSupplier scorerSupplier(ScoreMode scoreMode, float boost) {
-    if (toApproximation == null || matchedToDocsCount == 0) {
+    if (falsePositiveToDocsBits == null || matchedToDocsCount == 0) {
       return null; // no matches in this to segment
     }
     return new ScorerSupplier() {
       @Override
       public Scorer get(long leadCost) throws IOException {
         DocIdSetIterator approximation =
-            new BitSetIterator(toApproximation, matchedToDocsCount
+            new BitSetIterator(falsePositiveToDocsBits, matchedToDocsCount
 
             );
         TwoPhaseIterator twoPhase =
-            new TwoPhaseIterator(approximation) {
-              boolean pruned = false;
-
-              @Override
-              public boolean matches() throws IOException {
-                if (!pruned) {
-                  FixedBitSet matchedToDocs;
-                  int shift;
-                  // prune the approximation to the resolved matches: drop the
-                  // remaining range bits and or the matches back in at their
-                  // absolute positions, so the approximation stops visiting
-                  // non-matching docs
-                  shift = approximation.docID();
-                  // TODO the this is: it's enough to just confirm the match the return the control.
-                  // TODO there, should be a refined bitset
-                  // TODO when we need to refine an approx, we go throug join segments,
-                  // TODO and drop them into refined bitset until we confirm the match
-                  // TODO the order of iteration is: to side doc freq, which we neeed to persist and read then
-                  // TODO once we drop a join segment to refined bitset we exclude it from iterations
-                  // TODO also, just boundary check the following matches checks
-                  // TODO the following matches() checks, at first confirm with refied bitset,
-                  // TODO if it's false procede with to bitset dumping into refined bitset
-                  matchedToDocs = refineToMatches( shift);
-                  toApproximation.clear(shift, lastToDoc + 1);
-                  FixedBitSet.orRange(matchedToDocs, 0, toApproximation, shift, lastToDoc - shift + 1);
-                  pruned = true;
-                  return toApproximation.get(approximation.docID());
-                }
-                // the bitset spans [shift, lastToDoc] shifted to zero
-                // return matchedToDocs.get(approximation.docID() - shift);
-                assert /*return*/ toApproximation.get(approximation.docID()); // always true ??
-                return true;
-              }
-
-              @Override
-              public float matchCost() {
-                return matchedToDocsCount;
-              }
-            };
+            new LazyRefineTwoPhIter(approximation);
         return new ConstantScoreScorer(boost, scoreMode, twoPhase);
       }
 
