@@ -20,4 +20,5 @@ module org.apache.lucene.join {
   requires org.apache.lucene.core;
 
   exports org.apache.lucene.search.join;
+  exports org.apache.lucene.search.aijoin;
 }

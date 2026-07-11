@@ -1,25 +1,23 @@
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FilterCodecReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.MergePolicy.MergeContext;
 import org.apache.lucene.index.MergeTrigger;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
-import org.apache.lucene.index.MergePolicy.MergeContext;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.util.Bits;
 
@@ -35,7 +33,9 @@ final class AIJoinMergePolicy extends MergePolicy {
         continue;
       }
       Set<String> pairFieldNames = AIJoinUtil.pairFieldNames(AIJoinUtil.readFieldInfos(info));
-      if (!pairFieldNames.isEmpty() && pendingPairRemovals.containsAll(pairFieldNames)) {//todo sweep pending removals as well
+      if (!pairFieldNames.isEmpty()
+          && pendingPairRemovals.containsAll(
+              pairFieldNames)) { // todo sweep pending removals as well
         if (spec == null) {
           spec = new MergeSpecification();
         }
@@ -49,9 +49,11 @@ final class AIJoinMergePolicy extends MergePolicy {
   // droppedSegmentCount()
   private final AtomicInteger droppedSegmentCount = new AtomicInteger();
 
-  /** A merge over a single dead segment whose contents are reported as fully deleted, so {@link
+  /**
+   * A merge over a single dead segment whose contents are reported as fully deleted, so {@link
    * IndexWriter} drops it instead of rewriting it -- see {@link #wrapForMerge}. Non-static so it
-   * can report back to the outer policy's {@link #droppedSegmentCount}. */
+   * can report back to the outer policy's {@link #droppedSegmentCount}.
+   */
   private final class DropSegmentMerge extends OneMerge {
     DropSegmentMerge(List<SegmentCommitInfo> segments) {
       super(segments);
@@ -120,8 +122,8 @@ final class AIJoinMergePolicy extends MergePolicy {
   // caps how many distinct (from-searcher, to-searcher) pairs we remember snapshots for; a
   // best-effort bound since this only anchors a heuristic reap, never correctness
   private static final int MAX_TRACKED_SEARCHER_PAIRS = 256;
-  private final ConcurrentHashMap<Map.Entry<Object, Object>, Set<String>> lastNeededPairsBySearcherPair =
-      new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<Map.Entry<Object, Object>, Set<String>>
+      lastNeededPairsBySearcherPair = new ConcurrentHashMap<>();
   private final ConcurrentLinkedQueue<Map.Entry<Object, Object>> trackedSearcherPairsOrder =
       new ConcurrentLinkedQueue<>();
 
@@ -130,7 +132,8 @@ final class AIJoinMergePolicy extends MergePolicy {
   // reap; also size-capped, same reasoning
   private static final int MAX_PENDING_PAIR_REMOVALS = 4096;
   private final Set<String> pendingPairRemovals = ConcurrentHashMap.newKeySet();
-  private final ConcurrentLinkedQueue<String> pendingPairRemovalsOrder = new ConcurrentLinkedQueue<>();
+  private final ConcurrentLinkedQueue<String> pendingPairRemovalsOrder =
+      new ConcurrentLinkedQueue<>();
 
   // how often onCreateWeight actually bothers to sample searcher state; calls arriving sooner
   // than this after the last accepted sample are skipped outright, since sampling is only a
@@ -152,10 +155,12 @@ final class AIJoinMergePolicy extends MergePolicy {
     this.samplingIntervalNanos = unit.toNanos(duration);
   }
 
-  /** Approximates "has enough time passed since the last sample" with {@link System#nanoTime()}
-   * -- the JDK's cheapest monotonic timer, since it need not track wall-clock time -- gated by a
+  /**
+   * Approximates "has enough time passed since the last sample" with {@link System#nanoTime()} --
+   * the JDK's cheapest monotonic timer, since it need not track wall-clock time -- gated by a
    * single CAS so that under concurrent callers exactly one wins a given interval and the rest
-   * skip, without any lock. */
+   * skip, without any lock.
+   */
   private boolean shouldSample() {
     long interval = samplingIntervalNanos;
     if (interval <= 0) {
@@ -171,12 +176,16 @@ final class AIJoinMergePolicy extends MergePolicy {
     return nextSampleAtNanos.compareAndSet(next, now + interval);
   }
 
-  protected void onCreateWeight(Set<String> neededPairs, IndexSearcher fromSearcher, IndexSearcher searcher) throws IOException {
+  protected void onCreateWeight(
+      Set<String> neededPairs, IndexSearcher fromSearcher, IndexSearcher searcher)
+      throws IOException {
     if (!shouldSample()) {
       return;
     }
-    Object fromKey = AIJoinUtil.directoryKey(((DirectoryReader) fromSearcher.getIndexReader()).directory());
-    Object toKey = AIJoinUtil.directoryKey(((DirectoryReader) searcher.getIndexReader()).directory());
+    Object fromKey =
+        AIJoinUtil.directoryKey(((DirectoryReader) fromSearcher.getIndexReader()).directory());
+    Object toKey =
+        AIJoinUtil.directoryKey(((DirectoryReader) searcher.getIndexReader()).directory());
     Map.Entry<Object, Object> searcherKey = Map.entry(fromKey, toKey);
 
     Set<String> currentSnapshot = Set.copyOf(neededPairs);
@@ -191,18 +200,27 @@ final class AIJoinMergePolicy extends MergePolicy {
       for (String pairFieldName : previousSnapshot) {
         if (!currentSnapshot.contains(pairFieldName)) {
           AIJoinMergePolicy.addBounded(
-              pendingPairRemovals, pendingPairRemovalsOrder, pairFieldName, MAX_PENDING_PAIR_REMOVALS);
+              pendingPairRemovals,
+              pendingPairRemovalsOrder,
+              pairFieldName,
+              MAX_PENDING_PAIR_REMOVALS);
         }
       }
     }
   }
 
-  /** Puts {@code key} -> {@code value}, evicting the oldest key(s) once {@code map} exceeds {@code
+  /**
+   * Puts {@code key} -> {@code value}, evicting the oldest key(s) once {@code map} exceeds {@code
    * maxSize}. Approximate under races (an eviction can drop a key concurrently re-inserted, or the
-   * map can briefly exceed {@code maxSize}) -- acceptable since callers only use this as a soft
-   * cap on a best-effort cache. */
+   * map can briefly exceed {@code maxSize}) -- acceptable since callers only use this as a soft cap
+   * on a best-effort cache.
+   */
   static <K, V> V putBounded(
-      ConcurrentHashMap<K, V> map, ConcurrentLinkedQueue<K> insertionOrder, K key, V value, int maxSize) {
+      ConcurrentHashMap<K, V> map,
+      ConcurrentLinkedQueue<K> insertionOrder,
+      K key,
+      V value,
+      int maxSize) {
     V previous = map.put(key, value);
     if (previous == null) {
       insertionOrder.add(key);

@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import org.apache.lucene.index.ConcurrentMergeScheduler;
 import org.apache.lucene.index.DocValues;
@@ -36,11 +37,11 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.sandbox.aijoin.AIJoinUtil.JoinColumnModel;
+import org.apache.lucene.index.MergeScheduler;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.SearcherManager;
-import org.apache.lucene.store.ByteBuffersDirectory;
+import org.apache.lucene.search.aijoin.AIJoinUtil.JoinColumnModel;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.IOUtils;
 
@@ -48,12 +49,11 @@ import org.apache.lucene.util.IOUtils;
  * The auxiliary join index: a self-maintaining sidecar persisting per (from-segment, to-segment)
  * doc id mappings, so query-time joining reduces to bitset translation. It owns the sidecar's
  * {@link IndexWriter} and {@link SearcherManager}; pair columns are built lazily when an {@link
- * AIJoinQuery} first needs them, so users only {@link #open} (or {@link #inMemory()}) an instance
- * once, create queries with {@link #newJoinQuery} and search them with a bare to-side {@link
- * IndexSearcher}:
+ * AIJoinQuery} first needs them, so users only construct an instance once, create queries with
+ * {@link #newJoinQuery} and search them with a bare to-side {@link IndexSearcher}:
  *
  * <pre class="prettyprint">
- * AIJoinIndex joinIndex = AIJoinIndex.open(joinDir);   // once per process
+ * AIJoinIndex joinIndex = new AIJoinIndex(joinDir);   // once per process
  * Query q = joinIndex.newJoinQuery(fromField, fromQuery, fromSearcher, toField);
  * TopDocs hits = toSearcher.search(q, 10);
  * ...
@@ -66,7 +66,6 @@ import org.apache.lucene.util.IOUtils;
  */
 public final class AIJoinIndex implements Closeable {
 
-  private final Directory directory;
   private final IndexWriter writer;
   private final SearcherManager manager;
 
@@ -75,12 +74,13 @@ public final class AIJoinIndex implements Closeable {
    * pair, others wait on it. Completed futures stay put so a builder that raced a not-yet-visible
    * refresh cannot write a duplicate pair column.
    */
-  private final ConcurrentHashMap<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> pairBuilds =
-      new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>>
+      pairBuilds = new ConcurrentHashMap<>();
+
   // package-private (not private): tests reach in directly to observe the reaper's state
-  AIJoinMergePolicy mergePolicy;
-  private ConcurrentMergeScheduler mergeScheduler;
-  static final AIJoinWriter INSTANCE = new AIJoinDocWriter();//new AIJoinColumnWriter();
+  final AIJoinMergePolicy mergePolicy;
+  private final MergeScheduler mergeScheduler;
+  static final AIJoinWriter INSTANCE = new AIJoinDocWriter(); // new AIJoinColumnWriter();
 
   /** A pair's (from-segment, to-segment) leaf ordinals. */
   record SegmentsTuple(int fromLeafOrd, int toLeafOrd) {}
@@ -90,18 +90,19 @@ public final class AIJoinIndex implements Closeable {
    * plus current leaf ordinal) carrying it -- enough to locate and open the column's real
    * docvalues, or to check whether a pair already exists before deciding what still needs to be
    * built. A resolved cell's edges are tracked separately, as a plain {@link
-   * org.apache.lucene.sandbox.aijoin.AIJoinUtil.DocEdges}, since they don't change as this
-   * reference is refreshed.
+   * org.apache.lucene.search.aijoin.AIJoinUtil.DocEdges}, since they don't change as this reference
+   * is refreshed.
    */
-  record JoinSegmentReference(String pairFieldName, String joinSegmentName, int joinSegmentLeafOrd) {}
+  record JoinSegmentReference(
+      String pairFieldName, String joinSegmentName, int joinSegmentLeafOrd) {}
 
   /**
    * Scans {@code joinSearcher}'s leaves for every pair column whose field name satisfies {@code
    * isNeeded}, returning where each one lives. Used both to seed a fresh {@link
-   * org.apache.lucene.sandbox.aijoin.AIJoinWeight}'s view of already-built pairs, and by {@link
-   * ToLeafJoinContext} to relocate a pair whose cached segment reference no longer resolves.
-   * TODO subject for in-heap caching
-   * TODO commit's userdata might have a list of pairs with known segment ords and names
+   * org.apache.lucene.search.aijoin.AIJoinWeight}'s view of already-built pairs, and by {@link
+   * ToLeafJoinContext} to relocate a pair whose cached segment reference no longer resolves. TODO
+   * subject for in-heap caching TODO commit's userdata might have a list of pairs with known
+   * segment ords and names
    */
   static Map<String, JoinSegmentReference> extractExistingJoinColumns(
       IndexSearcher joinSearcher, Predicate<String> isNeeded) {
@@ -113,35 +114,48 @@ public final class AIJoinIndex implements Closeable {
         String splits[] = fieldInfo.name.split(AIJoinUtil.TO_DOC_VAL_BY_FROM_DOCNUM);
         if (splits.length == 2 && isNeeded.test(splits[1])) {
           existingJoinSegments.computeIfAbsent(
-              splits[1], fieldName -> new JoinSegmentReference(fieldName, segmentName, joinContext.ord));
+              splits[1],
+              fieldName -> new JoinSegmentReference(fieldName, segmentName, joinContext.ord));
         }
       }
     }
     return existingJoinSegments;
   }
 
-  private AIJoinIndex(Directory directory) throws IOException {
-    this.directory = directory;
-    this.writer =
-        new IndexWriter(
-            directory,
-            new IndexWriterConfig()
-                .setMergePolicy(this.mergePolicy = new AIJoinMergePolicy())
-                .setMergeScheduler(this.mergeScheduler = new ConcurrentMergeScheduler()));
-    this.manager = new SearcherManager(writer, null);
+  /**
+   * Opens a persistent auxiliary join index over the given directory, creating it if empty, using
+   * the default {@link AIJoinIndexConfig}. The caller retains ownership of the directory: {@link
+   * #close()} does not close it.
+   */
+  public AIJoinIndex(Directory directory) throws IOException {
+    this(directory, new AIJoinIndexConfig());
   }
 
   /**
-   * Opens a persistent auxiliary join index over the given directory, creating it if empty. Takes
-   * ownership of the directory: {@link #close()} closes it.
+   * Opens a persistent auxiliary join index over the given directory, creating it if empty, using
+   * the given {@link AIJoinIndexConfig}. The caller retains ownership of the directory: {@link
+   * #close()} does not close it.
    */
-  public static AIJoinIndex open(Directory directory) throws IOException {
-    return new AIJoinIndex(directory);
+  public AIJoinIndex(Directory directory, AIJoinIndexConfig config) throws IOException {
+    this(directory, config, new ConcurrentMergeScheduler());
   }
 
-  /** Opens a heap-resident auxiliary join index, rebuilt lazily from scratch every process run. */
-  public static AIJoinIndex inMemory() throws IOException {
-    return new AIJoinIndex(new ByteBuffersDirectory());
+  /**
+   * Opens a persistent auxiliary join index over the given directory, creating it if empty, using
+   * the given {@link AIJoinIndexConfig} and {@link MergeScheduler} in place of the default {@link
+   * ConcurrentMergeScheduler}. The caller retains ownership of the directory: {@link #close()} does
+   * not close it.
+   */
+  public AIJoinIndex(Directory directory, AIJoinIndexConfig config, MergeScheduler mergeScheduler)
+      throws IOException {
+    this.mergeScheduler = mergeScheduler;
+    this.mergePolicy = new AIJoinMergePolicy();
+    this.mergePolicy.setSweepInterval(config.getSweepSamplingIntervalNanos(), TimeUnit.NANOSECONDS);
+    this.writer =
+        new IndexWriter(
+            directory,
+            new IndexWriterConfig().setMergePolicy(mergePolicy).setMergeScheduler(mergeScheduler));
+    this.manager = new SearcherManager(writer, null);
   }
 
   /**
@@ -165,8 +179,8 @@ public final class AIJoinIndex implements Closeable {
   /**
    * Builds and persists the given missing pair columns, keyed by pair field name to their
    * (from-segment, to-segment) leaf ordinals. Pairs concurrently built by another thread are
-   * awaited, not rebuilt. On return the internal searcher manager is refreshed past every
-   * requested pair.
+   * awaited, not rebuilt. On return the internal searcher manager is refreshed past every requested
+   * pair.
    *
    * @return in memory data for just written segemts
    */
@@ -177,18 +191,20 @@ public final class AIJoinIndex implements Closeable {
       IndexReader toReader,
       String toField)
       throws IOException {
-    Map<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> owned = new LinkedHashMap<>();
+    Map<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> owned =
+        new LinkedHashMap<>();
     List<CompletableFuture<Map.Entry<String, JoinColumnModel>>> awaited = new ArrayList<>();
     for (String pairFieldName : missingPairs.keySet()) {
       CompletableFuture<Map.Entry<String, JoinColumnModel>> created = new CompletableFuture<>();
-      CompletableFuture<Map.Entry<String, JoinColumnModel>> existing = pairBuilds.putIfAbsent(pairFieldName, created);
+      CompletableFuture<Map.Entry<String, JoinColumnModel>> existing =
+          pairBuilds.putIfAbsent(pairFieldName, created);
       if (existing == null) {
         owned.put(pairFieldName, created);
       } else {
         awaited.add(existing);
       }
     }
-    Map<String,JoinColumnModel> loadedMappings = new LinkedHashMap<>();
+    Map<String, JoinColumnModel> loadedMappings = new LinkedHashMap<>();
     try {
       if (!owned.isEmpty()) {
         // all owned pairs go into a single batch: pair columns are addressed by from-side doc id,
@@ -209,7 +225,7 @@ public final class AIJoinIndex implements Closeable {
           loadedMappings.put(pairFieldName, mapping);
         }
         writeBatch(batchNumDocs, loadedMappings);
-        //TODO flush every single field to get single field segments
+        // TODO flush every single field to get single field segments
         for (Map.Entry<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> entry :
             owned.entrySet()) {
           entry
@@ -300,21 +316,30 @@ public final class AIJoinIndex implements Closeable {
   private synchronized void writeBatch(int batchNumDocs, Map<String, JoinColumnModel> mappings)
       throws IOException {
     AIJoinIndex.INSTANCE.writeJoinColumns(writer, batchNumDocs, mappings);
-    manager.maybeRefreshBlocking();// consider using the non-blocking maybeRefresh().
+    manager.maybeRefreshBlocking(); // consider using the non-blocking maybeRefresh().
   }
 
   @Override
   public void close() throws IOException {
-    IOUtils.close(manager, writer, directory);
+    IOUtils.close(manager, writer);
   }
 
-  public void onCreateWeight(Set<String> neededPairs, IndexSearcher fromSearcher, IndexSearcher searcher)
+  public void onCreateWeight(
+      Set<String> neededPairs, IndexSearcher fromSearcher, IndexSearcher searcher)
       throws IOException {
     this.mergePolicy.onCreateWeight(neededPairs, fromSearcher, searcher);
   }
 
-  /** Test-only: blocks until any in-flight merges (e.g. a dead-pair reap) finish. */
+  /**
+   * Test-only: blocks until any in-flight merges (e.g. a dead-pair reap) finish. Only supported
+   * when this index was opened with a {@link ConcurrentMergeScheduler} (the default).
+   */
   void waitForMerges() {
-    mergeScheduler.sync();
+    if (mergeScheduler instanceof ConcurrentMergeScheduler cms) {
+      cms.sync();
+    } else {
+      throw new UnsupportedOperationException(
+          "waitForMerges() requires a ConcurrentMergeScheduler, got " + mergeScheduler.getClass());
+    }
   }
 }

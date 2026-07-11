@@ -14,10 +14,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.regex.Pattern;
 import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.FieldInfosFormat;
@@ -32,8 +34,6 @@ import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ParallelLeafReader;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentReader;
-import java.util.HashSet;
-import java.util.Set;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
@@ -63,7 +63,7 @@ import org.apache.lucene.util.StringHelper;
 final class AIJoinUtil {
 
   /** Suffix of the always-written column persisting a pair's {min, max} from-doc edges. */
-  static final String FROM_EDGES_PREFIX = "fromDoc_edges_"; //TODO reduce to the singe letter
+  static final String FROM_EDGES_PREFIX = "fromDoc_edges_"; // TODO reduce to the singe letter
 
   /** Suffix of the always-written column persisting a pair's {min, max} to-doc edges. */
   static final String TO_EDGES_PREFIX = "toDoc_edges_";
@@ -85,6 +85,7 @@ final class AIJoinUtil {
     int[] fromDocEdges();
 
     int[] toDocEdges();
+
     /** this is rather doubtful */
     int toCount();
   }
@@ -107,7 +108,10 @@ final class AIJoinUtil {
       this.edges = edges;
     }
 
-    /** Returns a fresh single-valued cursor over the from-doc -> to-doc map, positioned before doc 0. */
+    /**
+     * Returns a fresh single-valued cursor over the from-doc -> to-doc map, positioned before doc
+     * 0.
+     */
     SortedNumericDocValues toDocByFromDoc() {
       return new ArrayBackedSortedNumericDocValues(toDocByFromDoc);
     }
@@ -119,8 +123,8 @@ final class AIJoinUtil {
 
   /**
    * Adapts an int-array from-doc -> to-doc map (as produced by {@link #computeDocMapping}, {@code
-   * -1} meaning no value) to the {@link SortedNumericDocValues} read API, so it can be consumed
-   * the same way as the on-disk join column. Always single-valued until M:N pairs are supported.
+   * -1} meaning no value) to the {@link SortedNumericDocValues} read API, so it can be consumed the
+   * same way as the on-disk join column. Always single-valued until M:N pairs are supported.
    */
   private static final class ArrayBackedSortedNumericDocValues extends SortedNumericDocValues {
     private final int[] toDocByFromDoc;
@@ -173,9 +177,8 @@ final class AIJoinUtil {
 
   /**
    * Merges the sorted term dictionaries of one (from-segment, to-segment) pair and resolves every
-   * from-side doc to its matching to-side doc id, along with the pair's from-doc and to-doc
-   * bounds. {@code scratch} is a shared from-ord indexed merge buffer, safe to reuse for the next
-   * pair.
+   * from-side doc to its matching to-side doc id, along with the pair's from-doc and to-doc bounds.
+   * {@code scratch} is a shared from-ord indexed merge buffer, safe to reuse for the next pair.
    *
    * <p>Docs already deleted at build time are skipped, purely to avoid persisting entries nobody
    * can ever match -- deletes are otherwise re-checked live at query time (from-side in {@code
@@ -294,9 +297,9 @@ final class AIJoinUtil {
   /**
    * Resolves {@code fromContext} against {@code cachedFromWeight}, filtering out deleted docs, or
    * returns {@code null} if the segment has no live match at all. Shared by {@link
-   * ToLeafJoinContext#createFromItersTasks}, which walks the returned iterator once per
-   * to-segment, and by {@link AIJoinQuery#createWeight}, which only needs to know whether the
-   * segment matches anything.
+   * ToLeafJoinContext#createFromItersTasks}, which walks the returned iterator once per to-segment,
+   * and by {@link AIJoinQuery#createWeight}, which only needs to know whether the segment matches
+   * anything.
    */
   static MatchingFromDocs matchingFromDocs(Weight cachedFromWeight, LeafReaderContext fromContext)
       throws IOException {
@@ -342,15 +345,14 @@ final class AIJoinUtil {
   }
 
   /**
-   * Reads a pair's persisted {@code {min, max}} edges (or {@code toCount}), all stored on doc 0
-   * of the column -- the read-side counterpart of {@link AIJoinWriter}'s edges columns.
+   * Reads a pair's persisted {@code {min, max}} edges (or {@code toCount}), all stored on doc 0 of
+   * the column -- the read-side counterpart of {@link AIJoinWriter}'s edges columns.
    */
   static int[] loadEdges(LeafReaderContext joinContext, String edgesFieldName) throws IOException {
     SortedNumericDocValues edgesDV = joinContext.reader().getSortedNumericDocValues(edgesFieldName);
     assert edgesDV != null : "expected edges column to be present: " + edgesFieldName;
     int zeroDoc = edgesDV.nextDoc();
-    assert zeroDoc == 0
-        : "expected edges column to be fully materialized, but got doc " + zeroDoc;
+    assert zeroDoc == 0 : "expected edges column to be fully materialized, but got doc " + zeroDoc;
     int[] values = new int[edgesDV.docValueCount()];
     for (int i = 0; i < values.length; i++) {
       values[i] = (int) edgesDV.nextValue();
@@ -386,7 +388,7 @@ final class AIJoinUtil {
     // key is insensitive to deletes but changes when the join field's docvalues are updated.
     long dvGen = context.reader().getFieldInfos().fieldInfo(field).getDocValuesGen();
     String key = field + ":" + StringHelper.idToString(segmentId) + ":" + dvGen;
-    //TODO this is dangerous, no one flip them back
+    // TODO this is dangerous, no one flip them back
     return NON_IDENTIFIER.matcher(key).replaceAll("_");
   }
 
@@ -429,8 +431,10 @@ final class AIJoinUtil {
     return segmentReader(joinContext.reader()).getSegmentName();
   }
 
-  /** A hashable key identifying the storage location behind {@code directory}, stable across
-   * separate opens of the same path so repeated calls resolve to the same cache entry. */
+  /**
+   * A hashable key identifying the storage location behind {@code directory}, stable across
+   * separate opens of the same path so repeated calls resolve to the same cache entry.
+   */
   static Object directoryKey(Directory directory) throws IOException {
     Directory unwrapped = FilterDirectory.unwrap(directory);
     if (unwrapped instanceof FSDirectory fsDir) {
@@ -439,8 +443,10 @@ final class AIJoinUtil {
     return unwrapped; // RAMDirectory/ByteBuffersDirectory etc: identity is the real key
   }
 
-  /** Every pair field name (the part after {@link #TO_DOC_VAL_BY_FROM_DOCNUM}) present in {@code
-   * fieldInfos}, i.e. every join pair this segment carries, needed or not. */
+  /**
+   * Every pair field name (the part after {@link #TO_DOC_VAL_BY_FROM_DOCNUM}) present in {@code
+   * fieldInfos}, i.e. every join pair this segment carries, needed or not.
+   */
   static Set<String> pairFieldNames(FieldInfos fieldInfos) {
     Set<String> names = new HashSet<>();
     for (FieldInfo fieldInfo : fieldInfos) {
@@ -452,8 +458,10 @@ final class AIJoinUtil {
     return names;
   }
 
-  /** Reads a segment's {@link FieldInfos} straight off disk, without opening a full reader.
-   * Mirrors {@code IndexWriter#readFieldInfos}, which isn't visible outside its package. */
+  /**
+   * Reads a segment's {@link FieldInfos} straight off disk, without opening a full reader. Mirrors
+   * {@code IndexWriter#readFieldInfos}, which isn't visible outside its package.
+   */
   static FieldInfos readFieldInfos(SegmentCommitInfo info) throws IOException {
     Codec codec = info.info.getCodec();
     FieldInfosFormat fieldInfosFormat = codec.fieldInfosFormat();

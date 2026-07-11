@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.util.List;
 import java.util.concurrent.Executor;

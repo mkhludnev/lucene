@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -56,6 +56,7 @@ public class TestAIJoinMergePolicy extends LuceneTestCase {
 
   private Directory parentsDir;
   private Directory childrenDir;
+  private Directory joinDir;
   private RandomIndexWriter parentsWriter;
   private RandomIndexWriter childrenWriter;
   private AIJoinIndex joinIndex;
@@ -71,13 +72,16 @@ public class TestAIJoinMergePolicy extends LuceneTestCase {
         new RandomIndexWriter(
             random(),
             parentsDir,
-            newIndexWriterConfig(new MockAnalyzer(random())).setMergePolicy(NoMergePolicy.INSTANCE));
+            newIndexWriterConfig(new MockAnalyzer(random()))
+                .setMergePolicy(NoMergePolicy.INSTANCE));
     childrenWriter =
         new RandomIndexWriter(
             random(),
             childrenDir,
-            newIndexWriterConfig(new MockAnalyzer(random())).setMergePolicy(NoMergePolicy.INSTANCE));
-    joinIndex = AIJoinIndex.open(newDirectory());
+            newIndexWriterConfig(new MockAnalyzer(random()))
+                .setMergePolicy(NoMergePolicy.INSTANCE));
+    joinDir = newDirectory();
+    joinIndex = new AIJoinIndex(joinDir);
     // this test drives many onCreateWeight calls back to back, well inside the default one-minute
     // sampling interval, and asserts on the reaper noticing every one of them
     joinIndex.mergePolicy.setSweepInterval(0, TimeUnit.NANOSECONDS);
@@ -85,7 +89,7 @@ public class TestAIJoinMergePolicy extends LuceneTestCase {
 
   @Override
   public void tearDown() throws Exception {
-    IOUtils.close(joinIndex, parentsWriter, childrenWriter, parentsDir, childrenDir);
+    IOUtils.close(joinIndex, joinDir, parentsWriter, childrenWriter, parentsDir, childrenDir);
     super.tearDown();
   }
 
@@ -104,8 +108,10 @@ public class TestAIJoinMergePolicy extends LuceneTestCase {
     return doc;
   }
 
-  /** Adds {@code numParents} parents (3 children each), committing every 3 parents so both sides
-   * end up segmented rather than a single flush. Returns the added parent ids. */
+  /**
+   * Adds {@code numParents} parents (3 children each), committing every 3 parents so both sides end
+   * up segmented rather than a single flush. Returns the added parent ids.
+   */
   private List<String> addParentsAndChildren(String parentIdPrefix, int numParents)
       throws IOException {
     List<String> parentIds = new ArrayList<>();
@@ -126,9 +132,11 @@ public class TestAIJoinMergePolicy extends LuceneTestCase {
     return parentIds;
   }
 
-  /** Deletes every parent in {@code parentIds} (and its children), then force-merges both sides
-   * down to a single segment each -- changing both sides' segment identities so every sidecar
-   * pair column referencing them goes stale. */
+  /**
+   * Deletes every parent in {@code parentIds} (and its children), then force-merges both sides down
+   * to a single segment each -- changing both sides' segment identities so every sidecar pair
+   * column referencing them goes stale.
+   */
   private void deleteParentsAndForceMerge(List<String> parentIds) throws IOException {
     for (String parentId : parentIds) {
       parentsWriter.deleteDocuments(new Term(PARENT_ID, parentId));
@@ -146,14 +154,17 @@ public class TestAIJoinMergePolicy extends LuceneTestCase {
     childrenWriter.commit();
   }
 
-  /** Runs the join query for every child against every parent and returns the matched parent ids,
+  /**
+   * Runs the join query for every child against every parent and returns the matched parent ids,
    * forcing {@link AIJoinQuery} to fully execute (not just build its {@link
-   * org.apache.lucene.search.Weight}) so missing pair columns actually get built into the sidecar. */
+   * org.apache.lucene.search.Weight}) so missing pair columns actually get built into the sidecar.
+   */
   private Set<String> searchAllParents(
       IndexSearcher parentsSearcher, IndexSearcher childrenSearcher) throws IOException {
     Query aiJoinQuery =
         joinIndex.newJoinQuery(PARENT_ID_FK, new MatchAllDocsQuery(), childrenSearcher, PARENT_ID);
-    TopDocs topDocs = parentsSearcher.search(aiJoinQuery, parentsSearcher.getIndexReader().maxDoc());
+    TopDocs topDocs =
+        parentsSearcher.search(aiJoinQuery, parentsSearcher.getIndexReader().maxDoc());
     Set<String> parentIds = new TreeSet<>();
     for (ScoreDoc scoreDoc : topDocs.scoreDocs) {
       parentIds.add(parentsSearcher.storedFields().document(scoreDoc.doc).get(PARENT_ID));
@@ -167,8 +178,7 @@ public class TestAIJoinMergePolicy extends LuceneTestCase {
     try (IndexReader childrenReader = childrenWriter.getReader();
         IndexReader parentsReader = parentsWriter.getReader()) {
       assertTrue(
-          "children index should be segmented before merging",
-          childrenReader.leaves().size() > 1);
+          "children index should be segmented before merging", childrenReader.leaves().size() > 1);
       assertTrue(
           "parents index should be segmented before merging", parentsReader.leaves().size() > 1);
 

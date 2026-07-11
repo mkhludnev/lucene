@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.io.IOException;
 import java.util.HashSet;
@@ -22,9 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Predicate;
-
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.sandbox.aijoin.AIJoinIndex.JoinSegmentReference;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LRUQueryCache;
 import org.apache.lucene.search.Query;
@@ -32,6 +30,7 @@ import org.apache.lucene.search.QueryCachingPolicy;
 import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.search.aijoin.AIJoinIndex.JoinSegmentReference;
 
 /**
  * Joins the from-side index to the to-side index this query is executed against, resolving
@@ -62,18 +61,27 @@ class AIJoinQuery extends Query {
     this.fromQuery = Objects.requireNonNull(fromQuery, "fromQuery");
     this.fromSearcher = Objects.requireNonNull(fromSearcher, "fromSearcher");
     this.toField = Objects.requireNonNull(toField, "toField");
-    // presumabily keep it in AIJoinIndex
-    this.cachedFromSearcher = new IndexSearcher(fromSearcher.getIndexReader());
-    this.cachedFromSearcher.setQueryCache(new LRUQueryCache(fromSearcher.getLeafContexts().size()+1,
-     fromSearcher.getIndexReader().maxDoc()/8 *2));
-    this.cachedFromSearcher.setQueryCachingPolicy(new QueryCachingPolicy() {
-      @Override
-      public boolean shouldCache(Query query) {
-        return true;
-      }
-      @Override
-      public void onUse(Query query) {}
-    });
+    this.cachedFromSearcher = wrapFromSearcher(fromSearcher);
+  }
+
+  // presumabily keep it in AIJoinIndex
+  private static IndexSearcher wrapFromSearcher(IndexSearcher fromSearcher) {
+    IndexSearcher cachedFromSearcher = new IndexSearcher(fromSearcher.getIndexReader());
+    cachedFromSearcher.setQueryCache(
+        new LRUQueryCache(
+            fromSearcher.getLeafContexts().size() + 1,
+            fromSearcher.getIndexReader().maxDoc() / 8 * 2));
+    cachedFromSearcher.setQueryCachingPolicy(
+        new QueryCachingPolicy() {
+          @Override
+          public boolean shouldCache(Query query) {
+            return true;
+          }
+
+          @Override
+          public void onUse(Query query) {}
+        });
+    return cachedFromSearcher;
   }
 
   @Override
@@ -105,7 +113,7 @@ class AIJoinQuery extends Query {
       }
     }
 
-    joinIndex.onCreateWeight(neededPairs, fromSearcher, searcher );//ignoring fields
+    joinIndex.onCreateWeight(neededPairs, fromSearcher, searcher); // ignoring fields
 
     // build any pair among neededPairs that isn't in the join index yet, up front, so this
     // weight's existingJoinSegments below is already complete instead of leaving the gaps to be
@@ -114,7 +122,7 @@ class AIJoinQuery extends Query {
 
     Predicate<String> isNeeded = neededPairs::contains;
 
-    Map<String,JoinSegmentReference> existingJoinSegments;
+    Map<String, JoinSegmentReference> existingJoinSegments;
     IndexSearcher joinSearcher = this.joinIndex.acquire();
     try {
       existingJoinSegments = AIJoinIndex.extractExistingJoinColumns(joinSearcher, isNeeded);

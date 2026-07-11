@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.io.IOException;
 import java.util.Locale;
@@ -101,13 +101,13 @@ public class AIJoinBenchmark {
   }
 
   public void runBenchmark() throws Exception {
-    // the auxiliary join index is opened once and reused by every round and pass; open() took
-    // ownership of the sidecar directory, so closing the join index closes it too
+    // the auxiliary join index is opened once and reused by every round and pass
     try (Directory parentsDir = new ByteBuffersDirectory();
         Directory childrenDir = new ByteBuffersDirectory();
+        Directory joinDir = new ByteBuffersDirectory();
         ExecutorService executor =
             Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
-        AIJoinIndex joinIndex = AIJoinIndex.open(new ByteBuffersDirectory())) {
+        AIJoinIndex joinIndex = new AIJoinIndex(joinDir)) {
       buildIndices(parentsDir, childrenDir);
       int numParents = NUM_PARENTS;
       for (int round = 0; round < ROUNDS; round++) {
@@ -169,8 +169,7 @@ public class AIJoinBenchmark {
       // create+search is comparable
       bench(
           "JoinUtil",
-          () ->
-              exactSearch(parentsSearcher, joinChildrenToParents(childFilter, childrenSearcher)));
+          () -> exactSearch(parentsSearcher, joinChildrenToParents(childFilter, childrenSearcher)));
       bench(
           "AIJoin",
           () ->
@@ -220,8 +219,8 @@ public class AIJoinBenchmark {
 
   /**
    * Runs a top-10 search with an uncapped total hits threshold, so {@code totalHits} is always
-   * exact instead of the default two-arg {@code search(query, 10)}'s early-terminated estimate
-   * past 1000 hits: with that default, JoinUtil and AIJoin visit docs in different orders and cost
+   * exact instead of the default two-arg {@code search(query, 10)}'s early-terminated estimate past
+   * 1000 hits: with that default, JoinUtil and AIJoin visit docs in different orders and cost
    * estimates and stop at different points, making their reported hit counts incomparable.
    */
   private static TopDocs exactSearch(IndexSearcher searcher, Query query) throws IOException {

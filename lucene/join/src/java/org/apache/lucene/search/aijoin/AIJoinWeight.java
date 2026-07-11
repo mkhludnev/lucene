@@ -1,17 +1,16 @@
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.io.IOException;
 import java.util.Map;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.sandbox.aijoin.AIJoinIndex.JoinSegmentReference;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
-
+import org.apache.lucene.search.aijoin.AIJoinIndex.JoinSegmentReference;
 
 final class AIJoinWeight extends Weight {
   final IndexSearcher maybeStaleJoinSearcher;
@@ -21,24 +20,23 @@ final class AIJoinWeight extends Weight {
   private final IndexReader toReader;
 
   /**
-   * [toSegmentOrd][fromSegmentOrd] -> the pair column resolved at construction time; null where
-   * the from segment has no cached matches, the pair maps no from-side values, or no cached match
-   * falls into the pair's from-doc range. Pair columns record the sidecar segment name, not a
-   * leaf context, so they stay valid across join reader refreshes.
+   * [toSegmentOrd][fromSegmentOrd] -> the pair column resolved at construction time; null where the
+   * from segment has no cached matches, the pair maps no from-side values, or no cached match falls
+   * into the pair's from-doc range. Pair columns record the sidecar segment name, not a leaf
+   * context, so they stay valid across join reader refreshes.
    */
-  //private final PairColumn[][] pairColumnsByTo;
+  // private final PairColumn[][] pairColumnsByTo;
 
-
-
-  AIJoinWeight(AIJoinQuery aiJoinQuery,
-    IndexSearcher maybeStaleJoinSearcher,
-    Map<String, JoinSegmentReference> existingJoinSegments,
+  AIJoinWeight(
+      AIJoinQuery aiJoinQuery,
+      IndexSearcher maybeStaleJoinSearcher,
+      Map<String, JoinSegmentReference> existingJoinSegments,
       IndexReader toReader,
       ScoreMode scoreMode,
       float boost)
       throws IOException {
     super(aiJoinQuery);
-    //this.aiJoinQuery = aiJoinQuery;
+    // this.aiJoinQuery = aiJoinQuery;
     this.maybeStaleJoinSearcher = maybeStaleJoinSearcher;
     this.existingJoinSegments = existingJoinSegments;
     this.scoreMode = scoreMode;
@@ -73,20 +71,23 @@ final class AIJoinWeight extends Weight {
   public ScorerSupplier scorerSupplier(LeafReaderContext tolrc) throws IOException {
     IndexSearcher joinSearcher = aiJQuery().joinIndex.acquire();
     try {
-      ToLeafJoinContext ctx = new ToLeafJoinContext(tolrc,
-       aiJQuery().fromField,
-       aiJQuery().fromQuery, aiJQuery().cachedFromSearcher,
-       aiJQuery().toField,
-       this.toReader,
-      this.existingJoinSegments,
-      this.maybeStaleJoinSearcher,joinSearcher,
-    aiJQuery().joinIndex);
+      ToLeafJoinContext ctx =
+          new ToLeafJoinContext(
+              tolrc,
+              aiJQuery().fromField,
+              aiJQuery().fromQuery,
+              aiJQuery().cachedFromSearcher,
+              aiJQuery().toField,
+              this.toReader,
+              this.existingJoinSegments,
+              this.maybeStaleJoinSearcher,
+              joinSearcher,
+              aiJQuery().joinIndex);
       return ctx.scorerSupplier(scoreMode, boost);
     } finally {
       aiJQuery().joinIndex.release(joinSearcher);
     }
   }
-
 
   @Override
   public boolean isCacheable(LeafReaderContext lrc) {

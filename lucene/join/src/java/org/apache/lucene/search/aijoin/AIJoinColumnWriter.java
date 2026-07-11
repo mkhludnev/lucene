@@ -1,22 +1,21 @@
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.column.Column;
 import org.apache.lucene.document.column.ColumnBatch;
 import org.apache.lucene.document.column.LongColumn;
-import org.apache.lucene.document.column.LongTupleCursor;
 import org.apache.lucene.document.column.LongColumn.NumericKind;
+import org.apache.lucene.document.column.LongTupleCursor;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.SortedNumericDocValues;
-import org.apache.lucene.sandbox.aijoin.AIJoinUtil.JoinColumnModel;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.aijoin.AIJoinUtil.JoinColumnModel;
 
 final class AIJoinColumnWriter extends AIJoinWriter {
 
@@ -30,8 +29,8 @@ final class AIJoinColumnWriter extends AIJoinWriter {
   }
 
   @Override
-  void writeJoinColumns(
-      IndexWriter writer, int batchNumDocs, Map<String, JoinColumnModel> mappings) throws IOException {
+  void writeJoinColumns(IndexWriter writer, int batchNumDocs, Map<String, JoinColumnModel> mappings)
+      throws IOException {
     List<Column> columns = new ArrayList<>();
     for (Map.Entry<String, JoinColumnModel> entry : mappings.entrySet()) {
       columns.addAll(createJoinColumns(entry.getValue(), entry.getKey()));
@@ -52,9 +51,9 @@ final class AIJoinColumnWriter extends AIJoinWriter {
   }
 
   /**
-   * Returns one pair's columns: the doc-map column resolving from-side doc ids to to-side doc
-   * ids, and the edges companion columns. The edges columns are written even when the pair
-   * maps nothing, so a once-built pair is detectable in the join index and never rebuilt.
+   * Returns one pair's columns: the doc-map column resolving from-side doc ids to to-side doc ids,
+   * and the edges companion columns. The edges columns are written even when the pair maps nothing,
+   * so a once-built pair is detectable in the join index and never rebuilt.
    */
   private static List<Column> createJoinColumns(JoinColumnModel mapping, String pairFieldName) {
     return List.of(
@@ -92,8 +91,8 @@ final class AIJoinColumnWriter extends AIJoinWriter {
 
   /**
    * A column persisting a doc mapping: batch-local doc number is the from-side doc id and the
-   * SORTED_NUMERIC docvalue is the matching to-side doc id. From docs without a match keep -1
-   * in the array and get no value, hence the column is sparse.
+   * SORTED_NUMERIC docvalue is the matching to-side doc id. From docs without a match keep -1 in
+   * the array and get no value, hence the column is sparse.
    */
   private static Column ordMapBatch(String fieldName, JoinColumnModel mapping) {
     return new LongColumn(

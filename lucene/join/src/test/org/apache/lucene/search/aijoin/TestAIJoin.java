@@ -14,9 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.sandbox.aijoin;
+package org.apache.lucene.search.aijoin;
 
-import com.carrotsearch.randomizedtesting.annotations.Seed;
 import com.carrotsearch.randomizedtesting.generators.RandomPicks;
 import java.io.Closeable;
 import java.io.IOException;
@@ -26,6 +25,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 import java.util.function.UnaryOperator;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -69,15 +69,25 @@ public class TestAIJoin extends LuceneTestCase {
   /** Shared per-test auxiliary join index: pair columns are built lazily by the first search. */
   private AIJoinIndex joinIndex;
 
+  private Directory joinDir;
+
   @Override
   public void setUp() throws Exception {
     super.setUp();
-    joinIndex = AIJoinIndex.inMemory();
+    joinDir = newDirectory();
+    // none of these affect join correctness, only internal segment layout, refresh latency, and
+    // dead-pair reap timing -- randomized to exercise all combinations
+    AIJoinIndexConfig config =
+        new AIJoinIndexConfig()
+            .setSingleFieldPerSegment(random().nextBoolean())
+            .setBlockingRefresh(random().nextBoolean())
+            .setSweepSamplingInterval(TestUtil.nextInt(random(), -1, 2), TimeUnit.MINUTES);
+    joinIndex = new AIJoinIndex(joinDir, config);
   }
 
   @Override
   public void tearDown() throws Exception {
-    joinIndex.close();
+    IOUtils.close(joinIndex, joinDir);
     super.tearDown();
   }
 
@@ -372,10 +382,10 @@ public class TestAIJoin extends LuceneTestCase {
 
   public void testAIJoinWithParentTermFilter() throws Exception {
     try (ParentChildIndices indices = new ParentChildIndices()) {
-      // open() takes ownership of the sidecar directory, so joinIndex.close() closes it too
       try (IndexReader childrenReader = indices.childrenWriter.getReader();
           IndexReader parentsReader = indices.parentsWriter.getReader();
-          AIJoinIndex joinIndex = AIJoinIndex.open(newDirectory())) {
+          Directory joinDir = newDirectory();
+          AIJoinIndex joinIndex = new AIJoinIndex(joinDir)) {
         Set<String> selectedChildren = randomChildrenSubset(indices);
         String color = RandomPicks.randomFrom(random(), COLORS);
 
