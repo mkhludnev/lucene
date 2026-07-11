@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.SortedSetDocValuesField;
@@ -77,6 +78,9 @@ public class TestAIJoinMergePolicy extends LuceneTestCase {
             childrenDir,
             newIndexWriterConfig(new MockAnalyzer(random())).setMergePolicy(NoMergePolicy.INSTANCE));
     joinIndex = AIJoinIndex.open(newDirectory());
+    // this test drives many onCreateWeight calls back to back, well inside the default one-minute
+    // sampling interval, and asserts on the reaper noticing every one of them
+    joinIndex.mergePolicy.setSweepInterval(0, TimeUnit.NANOSECONDS);
   }
 
   @Override

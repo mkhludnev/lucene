@@ -107,6 +107,11 @@ class AIJoinQuery extends Query {
 
     joinIndex.onCreateWeight(neededPairs, fromSearcher, searcher );//ignoring fields
 
+    // build any pair among neededPairs that isn't in the join index yet, up front, so this
+    // weight's existingJoinSegments below is already complete instead of leaving the gaps to be
+    // discovered lazily, one to-segment at a time, once scoring starts
+    joinIndex.ensureJoinSegments(neededPairs, cachedFromSearcher, fromField, searcher, toField);
+
     Predicate<String> isNeeded = neededPairs::contains;
 
     Map<String,JoinSegmentReference> existingJoinSegments;

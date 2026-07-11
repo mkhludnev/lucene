@@ -17,19 +17,11 @@
 package org.apache.lucene.sandbox.aijoin;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.Arrays;
-import java.util.List;
 import java.util.regex.Pattern;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.column.Column;
-import org.apache.lucene.document.column.LongColumn;
-import org.apache.lucene.document.column.LongColumn.NumericKind;
-import org.apache.lucene.document.column.LongTupleCursor;
 import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.FieldInfosFormat;
 import org.apache.lucene.index.DocValues;
-import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.FilterCodecReader;
@@ -79,33 +71,9 @@ final class AIJoinUtil {
   /** main join colums for join index to_doc_num[from_docnum] */
   static final String TO_DOC_VAL_BY_FROM_DOCNUM = "join_toDoc_";
 
-  private static final FieldType toDocsFieldType = new FieldType();
-
   static final String TO_COUNT_PREFIX = "num_toDoc_";
 
-  static {
-    toDocsFieldType.setDocValuesType(DocValuesType.SORTED_NUMERIC);
-    toDocsFieldType.freeze();
-  }
-
   private AIJoinUtil() {}
-
-  /**
-   * Merges the sorted term dictionaries of one (from-segment, to-segment) pair and returns the
-   * pair's columns: the doc-map column resolving from-side doc ids to to-side doc ids, and the
-   * edges companion columns. The edges columns are written even when the pair maps nothing, so a
-   * once-built pair is detectable in the join index and never rebuilt. {@code scratch} is a shared
-   * from-ord indexed merge buffer, safe to reuse for the next pair since the returned columns own
-   * their per-doc arrays.
-   */
-  static List<Column> createJoinColumns(JoinColumnModel mapping, String pairFieldName) {
-    return List.of(
-        ordMapBatch(pairFieldName, mapping),
-        edgesColumn(FROM_EDGES_PREFIX + pairFieldName, mapping.edges().fromDocEdges()),
-        edgesColumn(TO_EDGES_PREFIX + pairFieldName, mapping.edges().toDocEdges()),
-        edgesColumn(TO_COUNT_PREFIX + pairFieldName, new int[] {mapping.edges().toCount()})
-      );
-  }
 
   /**
    * A pair's {min, max} from-doc and to-doc bounds and match count, common to both a pair freshly
@@ -375,7 +343,7 @@ final class AIJoinUtil {
 
   /**
    * Reads a pair's persisted {@code {min, max}} edges (or {@code toCount}), all stored on doc 0
-   * of the column -- the read-side counterpart of {@link #edgesColumn}.
+   * of the column -- the read-side counterpart of {@link AIJoinWriter}'s edges columns.
    */
   static int[] loadEdges(LeafReaderContext joinContext, String edgesFieldName) throws IOException {
     SortedNumericDocValues edgesDV = joinContext.reader().getSortedNumericDocValues(edgesFieldName);
@@ -390,31 +358,6 @@ final class AIJoinUtil {
     return values;
   }
 
-  private static LongColumn edgesColumn(String fromEdgesFieldName, int[] fromDocEdges) {
-    return new LongColumn(
-        fromEdgesFieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
-      @Override
-      public LongTupleCursor tuples() {
-        return new LongTupleCursor() {
-          int i = -1;
-
-          @Override
-          public int nextDoc() {
-            if (++i < fromDocEdges.length) {
-              return 0; // try to put both vals at the doc 0
-            }
-            return DocIdSetIterator.NO_MORE_DOCS;
-          }
-
-          @Override
-          public long longValue() {
-            return (long) fromDocEdges[i];
-          }
-        };
-      }
-    };
-  }
-
   /**
    * The join index field name addressing the ordinal map of one (from-segment, to-segment) pair.
    */
@@ -424,42 +367,6 @@ final class AIJoinUtil {
       LeafReaderContext toContext,
       String toField) {
     return getSideKey(fromContext, fromField) + "_" + getSideKey(toContext, toField);
-  }
-
-  /**
-   * A column persisting a doc mapping: batch-local doc number is the from-side doc id and the
-   * SORTED_NUMERIC docvalue is the matching to-side doc id. From docs without a match keep -1 in
-   * the array and get no value, hence the column is sparse.
-   */
-  static Column ordMapBatch(String fieldName, JoinColumnModel mapping) {
-    Column column =
-        new LongColumn(TO_DOC_VAL_BY_FROM_DOCNUM+fieldName, toDocsFieldType, Column.Density.SPARSE, NumericKind.INT) {
-          @Override
-          public LongTupleCursor tuples() {
-            // a fresh cursor each call, per the Column contract, wrapping a fresh DV instance too
-            SortedNumericDocValues values = mapping.toDocByFromDoc();
-            return new LongTupleCursor() {
-              @Override
-              public int nextDoc() {
-                try {
-                  return values.nextDoc();
-                } catch (IOException e) {
-                  throw new UncheckedIOException(e);
-                }
-              }
-
-              @Override
-              public long longValue() {
-                try {
-                  return values.nextValue();
-                } catch (IOException e) {
-                  throw new UncheckedIOException(e);
-                }
-              }
-            };
-          }
-        };
-    return column;
   }
 
   // Lucene puts no hard constraints on field names, but conservatively keep side keys usable as

@@ -7,7 +7,9 @@ import java.util.Set;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
@@ -130,15 +132,56 @@ final class AIJoinMergePolicy extends MergePolicy {
   private final Set<String> pendingPairRemovals = ConcurrentHashMap.newKeySet();
   private final ConcurrentLinkedQueue<String> pendingPairRemovalsOrder = new ConcurrentLinkedQueue<>();
 
+  // how often onCreateWeight actually bothers to sample searcher state; calls arriving sooner
+  // than this after the last accepted sample are skipped outright, since sampling is only a
+  // heuristic hint feeding findMerges' reap decision, not a correctness requirement. Zero (or
+  // negative) disables throttling entirely. Defaults to one minute; see #setSweepInterval.
+  private volatile long samplingIntervalNanos = TimeUnit.MINUTES.toNanos(1);
+
+  // Long.MIN_VALUE marks "never sampled yet" so the very first call always goes through,
+  // regardless of what System.nanoTime()'s arbitrary origin happens to be.
+  private final AtomicLong nextSampleAtNanos = new AtomicLong(Long.MIN_VALUE);
+
+  /**
+   * Configures how often {@link #onCreateWeight} actually samples searcher state for the dead-pair
+   * reaper; calls arriving sooner than this after the last accepted sample are skipped, since
+   * sampling is only a heuristic hint, not a correctness requirement. Defaults to one minute. Pass
+   * zero (or a non-positive value) to sample on every call.
+   */
+  void setSweepInterval(long duration, TimeUnit unit) {
+    this.samplingIntervalNanos = unit.toNanos(duration);
+  }
+
+  /** Approximates "has enough time passed since the last sample" with {@link System#nanoTime()}
+   * -- the JDK's cheapest monotonic timer, since it need not track wall-clock time -- gated by a
+   * single CAS so that under concurrent callers exactly one wins a given interval and the rest
+   * skip, without any lock. */
+  private boolean shouldSample() {
+    long interval = samplingIntervalNanos;
+    if (interval <= 0) {
+      return true;
+    }
+    long now = System.nanoTime();
+    long next = nextSampleAtNanos.get();
+    // subtraction (not direct comparison) so this stays correct across nanoTime() overflow, per
+    // its javadoc
+    if (next != Long.MIN_VALUE && now - next < 0) {
+      return false;
+    }
+    return nextSampleAtNanos.compareAndSet(next, now + interval);
+  }
+
   protected void onCreateWeight(Set<String> neededPairs, IndexSearcher fromSearcher, IndexSearcher searcher) throws IOException {
-    //TODO skip frequent invocations
+    if (!shouldSample()) {
+      return;
+    }
     Object fromKey = AIJoinUtil.directoryKey(((DirectoryReader) fromSearcher.getIndexReader()).directory());
     Object toKey = AIJoinUtil.directoryKey(((DirectoryReader) searcher.getIndexReader()).directory());
     Map.Entry<Object, Object> searcherKey = Map.entry(fromKey, toKey);
 
     Set<String> currentSnapshot = Set.copyOf(neededPairs);
     Set<String> previousSnapshot =
-        AIJoinIndex.putBounded(
+        AIJoinMergePolicy.putBounded(
             lastNeededPairsBySearcherPair,
             trackedSearcherPairsOrder,
             searcherKey,
@@ -154,7 +197,27 @@ final class AIJoinMergePolicy extends MergePolicy {
     }
   }
 
-  /** Same eviction policy as {@link AIJoinIndex#putBounded}, for a plain set. */
+  /** Puts {@code key} -> {@code value}, evicting the oldest key(s) once {@code map} exceeds {@code
+   * maxSize}. Approximate under races (an eviction can drop a key concurrently re-inserted, or the
+   * map can briefly exceed {@code maxSize}) -- acceptable since callers only use this as a soft
+   * cap on a best-effort cache. */
+  static <K, V> V putBounded(
+      ConcurrentHashMap<K, V> map, ConcurrentLinkedQueue<K> insertionOrder, K key, V value, int maxSize) {
+    V previous = map.put(key, value);
+    if (previous == null) {
+      insertionOrder.add(key);
+      while (map.size() > maxSize) {
+        K oldest = insertionOrder.poll();
+        if (oldest == null) {
+          break;
+        }
+        map.remove(oldest);
+      }
+    }
+    return previous;
+  }
+
+  /** Same eviction policy as {@link AIJoinMergePolicy#putBounded}, for a plain set. */
   static <T> void addBounded(
       Set<T> set, ConcurrentLinkedQueue<T> insertionOrder, T value, int maxSize) {
     if (set.add(value)) {

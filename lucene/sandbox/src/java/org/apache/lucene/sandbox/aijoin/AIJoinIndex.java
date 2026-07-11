@@ -28,10 +28,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.Predicate;
-import org.apache.lucene.document.column.Column;
-import org.apache.lucene.document.column.ColumnBatch;
 import org.apache.lucene.index.ConcurrentMergeScheduler;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.FieldInfo;
@@ -83,26 +80,7 @@ public final class AIJoinIndex implements Closeable {
   // package-private (not private): tests reach in directly to observe the reaper's state
   AIJoinMergePolicy mergePolicy;
   private ConcurrentMergeScheduler mergeScheduler;
-
-  /** Puts {@code key} -> {@code value}, evicting the oldest key(s) once {@code map} exceeds {@code
-   * maxSize}. Approximate under races (an eviction can drop a key concurrently re-inserted, or the
-   * map can briefly exceed {@code maxSize}) -- acceptable since callers only use this as a soft
-   * cap on a best-effort cache. */
-  static <K, V> V putBounded(
-      ConcurrentHashMap<K, V> map, ConcurrentLinkedQueue<K> insertionOrder, K key, V value, int maxSize) {
-    V previous = map.put(key, value);
-    if (previous == null) {
-      insertionOrder.add(key);
-      while (map.size() > maxSize) {
-        K oldest = insertionOrder.poll();
-        if (oldest == null) {
-          break;
-        }
-        map.remove(oldest);
-      }
-    }
-    return previous;
-  }
+  static final AIJoinWriter INSTANCE = new AIJoinDocWriter();//new AIJoinColumnWriter();
 
   /** A pair's (from-segment, to-segment) leaf ordinals. */
   record SegmentsTuple(int fromLeafOrd, int toLeafOrd) {}
@@ -122,6 +100,8 @@ public final class AIJoinIndex implements Closeable {
    * isNeeded}, returning where each one lives. Used both to seed a fresh {@link
    * org.apache.lucene.sandbox.aijoin.AIJoinWeight}'s view of already-built pairs, and by {@link
    * ToLeafJoinContext} to relocate a pair whose cached segment reference no longer resolves.
+   * TODO subject for in-heap caching
+   * TODO commit's userdata might have a list of pairs with known segment ords and names
    */
   static Map<String, JoinSegmentReference> extractExistingJoinColumns(
       IndexSearcher joinSearcher, Predicate<String> isNeeded) {
@@ -214,7 +194,6 @@ public final class AIJoinIndex implements Closeable {
         // all owned pairs go into a single batch: pair columns are addressed by from-side doc id,
         // so a batch must start at doc 0 of its sidecar segment, which writeBatch guarantees by
         // flushing one batch per commit
-        List<Column> columns = new ArrayList<>();
         int batchNumDocs = 0;
         for (String pairFieldName : owned.keySet()) {
           SegmentsTuple position = missingPairs.get(pairFieldName);
@@ -226,12 +205,10 @@ public final class AIJoinIndex implements Closeable {
                       DocValues.getSortedSet(fromContext.reader(), fromField).getValueCount())];
           AIJoinUtil.JoinColumnModel mapping =
               AIJoinUtil.computeDocMapping(fromContext, fromField, toContext, toField, scratch);
-          columns.addAll( // what if there's no hits ???!! TODO needs to wite a thumbnail??
-              AIJoinUtil.createJoinColumns(mapping, pairFieldName));
           batchNumDocs = Math.max(batchNumDocs, fromContext.reader().maxDoc());
           loadedMappings.put(pairFieldName, mapping);
         }
-        writeBatch(batchNumDocs, columns);
+        writeBatch(batchNumDocs, loadedMappings);
         //TODO flush every single field to get single field segments
         for (Map.Entry<String, CompletableFuture<Map.Entry<String, JoinColumnModel>>> entry :
             owned.entrySet()) {
@@ -271,25 +248,59 @@ public final class AIJoinIndex implements Closeable {
   }
 
   /**
+   * Eagerly builds and persists every pair column in {@code neededPairs} not yet present in this
+   * join index, so an {@link AIJoinWeight} being constructed at {@link AIJoinQuery#createWeight}
+   * already sees a complete view of the pairs it needs, instead of discovering gaps lazily -- one
+   * to-segment at a time -- in {@link ToLeafJoinContext}. Missing pairs are resolved to their
+   * (from-segment, to-segment) leaf ordinals by crossing {@code fromSearcher}'s leaves against
+   * {@code toSearcher}'s leaves; pairs concurrently built by another thread are awaited, not
+   * rebuilt (see {@link #writeJoinSegments}).
+   */
+  void ensureJoinSegments(
+      Set<String> neededPairs,
+      IndexSearcher fromSearcher,
+      String fromField,
+      IndexSearcher toSearcher,
+      String toField)
+      throws IOException {
+    Map<String, JoinSegmentReference> existing;
+    IndexSearcher joinSearcher = acquire();
+    try {
+      existing = extractExistingJoinColumns(joinSearcher, neededPairs::contains);
+    } finally {
+      release(joinSearcher);
+    }
+    if (existing.keySet().containsAll(neededPairs)) {
+      return;
+    }
+    Map<String, SegmentsTuple> missingPairs = new LinkedHashMap<>();
+    for (LeafReaderContext fromContext : fromSearcher.getLeafContexts()) {
+      for (LeafReaderContext toContext : toSearcher.getLeafContexts()) {
+        String pairFieldName = AIJoinUtil.pairFieldName(fromContext, fromField, toContext, toField);
+        if (neededPairs.contains(pairFieldName) && !existing.containsKey(pairFieldName)) {
+          missingPairs.put(pairFieldName, new SegmentsTuple(fromContext.ord, toContext.ord));
+        }
+      }
+    }
+    if (!missingPairs.isEmpty()) {
+      writeJoinSegments(
+          missingPairs,
+          fromSearcher.getIndexReader(),
+          fromField,
+          toSearcher.getIndexReader(),
+          toField);
+    }
+  }
+
+  /**
    * Serializes sidecar writes: one batch per commit keeps every batch at doc 0 of its own segment,
    * preserving pair-column doc number == from-side doc id. Completing builders' futures after this
    * returns guarantees waiters observe the refreshed reader.
    */
-  private synchronized void writeBatch(int batchNumDocs, List<Column> columns) throws IOException {
-    writer.addBatch(
-        new ColumnBatch() {
-          @Override
-          public int numDocs() {
-            return batchNumDocs;
-          }
-
-          @Override
-          public Iterable<Column> columns() {
-            return columns;
-          }
-        });
-    writer.commit();
-    manager.maybeRefreshBlocking();
+  private synchronized void writeBatch(int batchNumDocs, Map<String, JoinColumnModel> mappings)
+      throws IOException {
+    AIJoinIndex.INSTANCE.writeJoinColumns(writer, batchNumDocs, mappings);
+    manager.maybeRefreshBlocking();// consider using the non-blocking maybeRefresh().
   }
 
   @Override
